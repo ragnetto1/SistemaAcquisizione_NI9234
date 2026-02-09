@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Sensors><Sensor><NomeRisorsa>352B01</NomeRisorsa><supportedDAQ>NI9234</supportedDAQ><GrandezzaFisica>g</GrandezzaFisica><CalibrationPoints><Point volt="0" value="0" /><Point volt="1000" value="20" /></CalibrationPoints></Sensor></Sensors>

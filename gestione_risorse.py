@@ -5,7 +5,7 @@ import numpy as np
 from PyQt5 import QtCore, QtWidgets
 import pyqtgraph as pg
 
-SENSOR_DB_DEFAULT = r"C:\UG-WORK\SistemaAcquisizione_NI9201\Sensor database.xml"
+SENSOR_DB_DEFAULT = r"C:\UG-WORK\SistemaAcquisizione_NI9234\Sensor database.xml"
 
 # XML tags
 XML_ROOT = "Sensors"

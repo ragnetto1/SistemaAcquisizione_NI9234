@@ -38,8 +38,10 @@ COL_LIMIT_MAX = 8
 COL_LIMIT_MIN = 9
 
 # Percorso di default richiesto
-DEFAULT_SAVE_DIR = r"C:\UG-WORK\SistemaAcquisizione_NI9201"
-SENSOR_DB_DEFAULT = r"C:\UG-WORK\SistemaAcquisizione_NI9201\Sensor database.xml"
+# Per la NI‑9234 il progetto utilizza directory dedicate.  I percorsi
+# predefiniti possono essere personalizzati modificando queste costanti.
+DEFAULT_SAVE_DIR = r"C:\UG-WORK\SistemaAcquisizione_NI9234"
+SENSOR_DB_DEFAULT = r"C:\UG-WORK\SistemaAcquisizione_NI9234\Sensor database.xml"
 
 # XML tag (compat vecchio e nuovo formato multi-punti)
 XML_ROOT  = "Sensors"
@@ -66,12 +68,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.acq = acq_manager
         self.merger = merger
 
-        # Imposta il titolo della finestra in base al modello della scheda selezionato.
-        try:
-            bt = getattr(self.acq, "board_type", "NI9201")
-        except Exception:
-            bt = "NI9201"
-        self.setWindowTitle(f"{bt} Acquisition — Demo Architettura")
+        # Finestra per il modulo NI‑9234.  In questo progetto non è prevista
+        # la selezione di altri modelli di scheda.
+        self.setWindowTitle("NI 9234 Acquisition — Demo Architettura")
         self.resize(1200, 740)
 
         # stati UI/logica
@@ -81,11 +80,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # mappature canali
         self._current_phys_order = []                    # ordine fisico corrente avviato
-        # Determina il numero di canali in base alla scheda DAQ
+        # La NI‑9234 ha quattro canali simultanei
         try:
-            num_chans = int(getattr(self.acq, "num_channels", 8))
+            num_chans = int(getattr(self.acq, "num_channels", 4))
         except Exception:
-            num_chans = 8
+            num_chans = 4
         # Inizializza le strutture mappatura e calibrazione per ciascun canale fisico
         self._label_by_phys = {f"ai{i}": f"ai{i}" for i in range(num_chans)}   # label utente “Nome canale”
         self._sensor_type_by_phys = {f"ai{i}": "Voltage" for i in range(num_chans)}
@@ -103,11 +102,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._chart_curves_by_phys = {}
         self._instant_curves_by_phys = {}
 
-        # TDMS saving: imposta la directory di salvataggio in base al modello della scheda.
-        if "9234" in (bt or "").upper():
-            self._save_dir = r"C:\UG-WORK\SistemaAcquisizione_NI9234"
-        else:
-            self._save_dir = DEFAULT_SAVE_DIR
+        # Directory di salvataggio per la NI‑9234 (nessun cambio dinamico per altri modelli)
+        self._save_dir = DEFAULT_SAVE_DIR
         self._base_filename = "SenzaNome.tdms"
         self._active_subdir = None
         self._countdown = 60
@@ -127,11 +123,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # Track if we are in stall mode to avoid repeated adjustments
         self._stall_active = False
 
-        # Path for the current sensor database. Usa un percorso separato per ciascuna scheda.
-        if "9234" in (bt or "").upper():
-            self._sensor_db_path = r"C:\UG-WORK\SistemaAcquisizione_NI9234\Sensor database.xml"
-        else:
-            self._sensor_db_path = SENSOR_DB_DEFAULT
+        # Percorso del database sensori per la NI‑9234
+        self._sensor_db_path = SENSOR_DB_DEFAULT
 
         # UI
         self._build_ui()
@@ -511,15 +504,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._device_ready = bool(metas)
 
         # scelta automatica / dialog se più device
-        # Determine the friendly name of the board for messages.
-        try:
-            bt = getattr(self.acq, "board_type", "NI9201")
-        except Exception:
-            bt = "NI9201"
+        # Messaggi specifici per la NI‑9234
         if not metas:
             QtWidgets.QMessageBox.information(
                 self, "Nessun dispositivo",
-                f"Nessun {bt} trovato. Verifica in NI‑MAX (anche simulati)."
+                "Nessun NI‑9234 trovato. Verifica in NI‑MAX (anche simulati)."
             )
         elif len(metas) == 1:
             self.cmbDevice.setCurrentIndex(0)
@@ -550,14 +539,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             sim = " [SIMULATED]" if m.get("is_simulated") else ""
             label = f"{name} — {pt} — ({ch}){sim}" if ch else f"{name} — {pt}{sim}"
             items.append(label)
-        # Messaggio dinamico in base alla scheda corrente
-        try:
-            bt = getattr(self.acq, "board_type", "NI9201")
-        except Exception:
-            bt = "NI9201"
+        # Messaggio specifico per la NI‑9234
         item, ok = QtWidgets.QInputDialog.getItem(
             self, "Seleziona dispositivo",
-            f"Sono presenti più moduli {bt}.\nScegli quello da usare:",
+            "Sono presenti più moduli NI‑9234.\nScegli quello da usare:",
             items, 0, False
         )
         if not ok or not item:

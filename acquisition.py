@@ -30,17 +30,45 @@ def _align_up(value: int, base: int) -> int:
 
 class AcquisitionManager:
     """
-    Core NI-9201 con:
+    Core specifico per la scheda NI‑9234 con:
       • stream continuo Every N Samples
       • grafici decimati
-      • writer TDMS a rotazione (default 60 s) SENZA PERDITE (sample-accurate)
-      • scrittura streaming (mini-segmenti) a RAM costante
-      • Time continuo in ogni file e proprietà wf_* coerenti
+      • writer TDMS a rotazione (default 60 s) SENZA PERDITE (sample‑accurate)
+      • scrittura streaming (mini‑segmenti) a RAM costante
+      • tempo continuo in ogni file e proprietà ``wf_*`` coerenti
       • stop_graceful: svuota il buffer driver e salva il residuo
+
+    Questo gestore è progettato esclusivamente per la NI‑9234, che dispone
+    di quattro ingressi analogici simultanei con range ±5 V e frequenza
+    massima di circa 51,2 kS/s per canale【990734219581306†L226-L234】.
+    Il supporto per la NI‑9201 è stato rimosso in questo progetto per
+    semplificare la configurazione e l’uso.
     """
 
     def __init__(self, sample_rate=10000.0, callback_chunk=1000, rotate_seconds=60, board_type: str = "NI9234"):
-        self.board_type = str(board_type or "NI9234")
+        """
+        Initialize the acquisition manager.
+
+        Parameters
+        ----------
+        sample_rate : float, optional
+            Desired per‑channel sampling rate in Hz. Defaults to 10 kS/s. The actual
+            sampling rate will be clamped to the maximum supported by the
+            NI‑9234 (51.2 kS/s per channel【990734219581306†L226-L234】).
+        callback_chunk : int, optional
+            Number of samples per channel to read in each callback. Must be a
+            positive integer. Defaults to 1000.
+        rotate_seconds : int, optional
+            Duration (in seconds) of each TDMS file segment before rotation.
+            Defaults to 60 s.
+        board_type : str, optional
+            Ignored parameter retained for backwards compatibility; the
+            acquisition is always configured for the NI‑9234.
+        """
+        # Always use NI‑9234; ignore the board_type argument.  Retain the
+        # attribute for compatibility with existing interfaces, but do not
+        # attempt to auto‑detect or support other devices in this project.
+        self.board_type = "NI9234"
         # Per‑channel sampling rate requested by user (before clamping to hardware).
         self.sample_rate = float(sample_rate)
         self.callback_chunk = int(callback_chunk)
@@ -65,15 +93,9 @@ class AcquisitionManager:
 
         # temp_dir is initialised at the top of __init__ based on board_type.
 
-        # Determine number of channels and default input range based on the board type.
-        if "9234" in self.board_type.upper():
-            self.num_channels = 4
-            # The NI‑9234 supports ±5 V range.
-            self.default_range: Tuple[float, float] = (-5.0, 5.0)
-        else:
-            # Default to NI‑9201 (8‑channel, ±10 V range).
-            self.num_channels = 8
-            self.default_range = (-10.0, 10.0)
+        # Fixed configuration for NI‑9234: four channels, ±5 V range.
+        self.num_channels = 4
+        self.default_range: Tuple[float, float] = (-5.0, 5.0)
 
         # Zero / maps / channels
         self._zero: Dict[str, Optional[float]] = {}
@@ -125,6 +147,21 @@ class AcquisitionManager:
         # value is computed when the acquisition task starts. It is used to
         # estimate the backlog queued for disk in get_backlog_estimate().
         self._block_bytes: int = 0
+
+        # Directory used to hold temporary TDMS segments before they are
+        # assembled and saved by the writer thread.  Create a unique
+        # subdirectory inside the system temporary directory.  Without this
+        # initialization, the writer flush routine would fail with an
+        # attribute error if recording is enabled.
+        try:
+            # Use a prefix to identify that this directory belongs to a NI‑9234 acquisition
+            temp_base = tempfile.gettempdir()
+            unique = f"ni9234_acq_{uuid.uuid4().hex}"
+            self.temp_dir = os.path.abspath(os.path.join(temp_base, unique))
+            os.makedirs(self.temp_dir, exist_ok=True)
+        except Exception:
+            # Fallback to current working directory if temp directory cannot be created
+            self.temp_dir = os.path.abspath(os.getcwd())
 
     # -------------------- API verso la UI --------------------
     def set_output_directory(self, path: str):
@@ -461,16 +498,11 @@ class AcquisitionManager:
 
     def list_current_devices_meta(self) -> List[Dict[str, Any]]:
         """
-        Return metadata for the currently selected board type. If the board
-        type is NI9201, this calls list_ni9201_devices_meta(); if NI9234,
-        it calls list_ni9234_devices_meta(). If neither, returns an empty list.
+        Return metadata for NI‑9234 modules (real or simulated).  This
+        method always returns the result of ``list_ni9234_devices_meta`` because
+        the NI‑9234 is the only supported device in this project.
         """
-        bt = str(getattr(self, "board_type", "")).upper()
-        if "9234" in bt:
-            return self.list_ni9234_devices_meta()
-        if "9201" in bt:
-            return self.list_ni9201_devices_meta()
-        return []
+        return self.list_ni9234_devices_meta()
 
     def _get_device_by_name(self, name):
         if System is None:
@@ -484,18 +516,12 @@ class AcquisitionManager:
         self.max_single_rate_hz = None
         self.max_multi_rate_hz = None
         dev = self._get_device_by_name(device_name)
-        # Determine fallback rates based on board type. If no device is found
-        # (e.g. simulation only), set reasonable defaults. NI‑9201 has an
-        # aggregate sample rate of 500 kS/s; NI‑9234 can sample each channel
-        # up to 51.2 kS/s simultaneously.
+        # Fallback when the device cannot be queried (e.g. simulation only).
+        # For the NI‑9234 the maximum per‑channel rate is 51.2 kS/s and the
+        # aggregate rate is four times higher (simultaneous sampling)【990734219581306†L226-L234】.
         if dev is None:
-            if "9234" in (self.board_type or "").upper():
-                self.max_single_rate_hz = 51_200.0
-                self.max_multi_rate_hz = 51_200.0 * max(1, self.num_channels)
-            else:
-                # 9201 default
-                self.max_multi_rate_hz = 500_000.0
-                self.max_single_rate_hz = 500_000.0
+            self.max_single_rate_hz = 51_200.0
+            self.max_multi_rate_hz = 51_200.0 * max(1, self.num_channels)
             return
         try:
             v = getattr(dev, "ai_max_single_chan_rate", None)
@@ -509,15 +535,9 @@ class AcquisitionManager:
             pass
         # After querying the device, apply fallback if values are not valid.
         if not self.max_multi_rate_hz or self.max_multi_rate_hz <= 0:
-            if "9234" in (self.board_type or "").upper():
-                self.max_multi_rate_hz = 51_200.0 * max(1, self.num_channels)
-            else:
-                self.max_multi_rate_hz = 500_000.0
+            self.max_multi_rate_hz = 51_200.0 * max(1, self.num_channels)
         if not self.max_single_rate_hz or self.max_single_rate_hz <= 0:
-            if "9234" in (self.board_type or "").upper():
-                self.max_single_rate_hz = 51_200.0
-            else:
-                self.max_single_rate_hz = self.max_multi_rate_hz
+            self.max_single_rate_hz = 51_200.0
 
     def _compute_per_channel_rate(self, device_name: str, n_channels: int) -> float:
         self._read_device_caps(device_name)
