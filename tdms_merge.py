@@ -33,7 +33,43 @@ class TdmsMerger:
       - Se alcuni segmenti non hanno il canale "Time", si ricava N dai canali dati
       - t0_first e fs sono ricavati dal primo segmento che li dichiara (via wf_*)
       - Se fs manca ovunque, fallback a 1.0 Hz (evita crash)
+    
+    Oltre a fondere i dati temporali, questo oggetto può opzionalmente
+    apporre uno spettro FFT al file TDMS finale.  La proprietà
+    ``fft_data`` può essere impostata prima di chiamare ``merge_temp_tdms``
+    per definire i dati dello spettro.  Quando presente, un segmento
+    aggiuntivo verrà creato contenente un gruppo "FFT" con il canale di
+    frequenza e i canali di magnitudine per ciascun segnale.
     """
+
+    def __init__(self) -> None:
+        """
+        Initialise a new TdmsMerger instance.  In addition to the default
+        behaviour of merging time‑domain data, this class can optionally
+        append FFT data to the merged file.  The FFT information should be
+        supplied via the ``fft_data`` attribute before invoking
+        ``merge_temp_tdms``.  ``fft_data`` must be a dictionary with the
+        following keys:
+
+        - ``"freq"`` (numpy.ndarray): vector of frequency values (in Hz).
+        - ``"channels"`` (dict[str, numpy.ndarray]): mapping from a
+          channel name to its FFT magnitude spectrum.
+        - ``"units"`` (dict[str, str], optional): mapping from channel
+          name to the unit string associated with the magnitude spectrum.
+        - ``"duration"`` (float, optional): length of the time window
+          (in seconds) used to compute the FFT.
+
+        If ``fft_data`` is provided, a final TDMS segment with group name
+        "FFT" will be appended to the merged file.  A channel named
+        "Frequency [Hz]" will store the frequency vector, and channels
+        whose names are taken from the keys of ``channels`` will store the
+        corresponding spectra.
+        """
+        # Placeholder for optional FFT data.  The user of this class may
+        # assign a dictionary to this attribute before calling
+        # merge_temp_tdms().  If left as None, no FFT segment will be
+        # appended.
+        self.fft_data: Optional[dict] = None
 
     # -------------------- utilità interne --------------------
     def _pick_group(self, td: TdmsFile):
@@ -300,6 +336,74 @@ class TdmsMerger:
                         progress_cb(seg_index, total_segs)
                     except Exception:
                         pass
+
+            # After streaming all segments, optionally append an FFT segment.
+            # If fft_data is provided by the caller, create a final segment with a
+            # dedicated group ("FFT") containing the frequency vector and FFT
+            # magnitude channels.  This operation must be performed before
+            # closing the writer to ensure the segment is written to the file.
+            if getattr(self, 'fft_data', None):
+                try:
+                    fft_dict = self.fft_data or {}
+                    freq = fft_dict.get("freq", None)
+                    channel_map = fft_dict.get("channels", {}) or {}
+                    units_map = fft_dict.get("units", {}) or {}
+                    duration = fft_dict.get("duration", None)
+                    # Only write an FFT segment if a frequency vector and at least
+                    # one channel are provided and they have consistent lengths.
+                    if isinstance(freq, np.ndarray) and freq.size > 0 and channel_map:
+                        # Determine length of FFT and ensure each channel matches
+                        nfft = int(freq.size)
+                        valid_channels = []
+                        for ch_name, arr in channel_map.items():
+                            try:
+                                if isinstance(arr, np.ndarray) and arr.size == nfft:
+                                    valid_channels.append((ch_name, arr))
+                            except Exception:
+                                pass
+                        if valid_channels:
+                            # Build root and group objects for the FFT segment.  Add
+                            # metadata describing the FFT duration and generation
+                            # timestamp.  The start time of the FFT segment is not
+                            # tied to the waveform time axis, so wf_start_time is
+                            # omitted.
+                            root_fft = RootObject(properties={
+                                "created": datetime.datetime.now(),
+                                "fft_duration": float(duration) if duration is not None else None,
+                                "fft_appended": True,
+                            })
+                            group_fft = GroupObject("FFT")
+                            fft_channels = []
+                            # Frequency axis channel
+                            try:
+                                props = {
+                                    "unit_string": "Hz",
+                                    "stored_domain": "frequency"
+                                }
+                                fft_channels.append(ChannelObject("FFT", "Frequency [Hz]", freq.astype(np.float64), properties=props))
+                            except Exception:
+                                pass
+                            # Magnitude channels for each valid spectrum
+                            for ch_name, arr in valid_channels:
+                                try:
+                                    unit_str = units_map.get(ch_name, "")
+                                    props = {
+                                        "unit_string": unit_str or "",
+                                        "stored_domain": "magnitude"
+                                    }
+                                    fft_channels.append(ChannelObject("FFT", ch_name, arr.astype(np.float64), properties=props))
+                                except Exception:
+                                    pass
+                            # Write the FFT segment
+                            try:
+                                w.write_segment([root_fft, group_fft] + fft_channels)
+                            except Exception:
+                                pass
+                except Exception:
+                    # In case of any failure while writing FFT data, silently
+                    # continue without appending the segment.  The time-domain
+                    # data have already been merged successfully.
+                    pass
         # Atomically rename the temporary file to its final name
         try:
             os.replace(tmp_out, out_path)
