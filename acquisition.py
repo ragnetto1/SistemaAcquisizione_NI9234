@@ -174,6 +174,14 @@ class AcquisitionManager:
         self._sensor_map_by_phys = dict(sensor_map_by_phys or {})
 
     @property
+    def chart_decimation(self) -> int:
+        """Return decimation factor used for concatenated chart points."""
+        try:
+            return max(1, int(self._chart_decim or 1))
+        except Exception:
+            return 1
+
+    @property
     def recording_enabled(self) -> bool:
         return self._recording_enabled
 
