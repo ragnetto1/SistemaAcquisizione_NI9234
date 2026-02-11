@@ -106,17 +106,14 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # have its own curve in the FFT plot. These curves are created when
         # a new acquisition starts in _reset_plots_curves().
         self._fft_curves_by_phys = {}
+        self._fft_win_line_start = None
+        self._fft_win_line_end = None
 
-        # --- FFT configuration and buffers ---
+        # --- FFT configuration ---
         # Duration of the time window (in seconds) used for FFT computation.
         # This value can be modified by the user via a spin box.  A default
         # of 5 seconds is chosen as a reasonable starting point.
         self._fft_duration_seconds: float = 5.0
-        # Per‑channel ring buffers storing the most recent samples for FFT.
-        # Each entry is a deque with a maximum length computed from the
-        # sampling rate and the FFT window duration.  The buffers are
-        # initialised when an acquisition starts.
-        self._fft_buffers_by_phys: Dict[str, deque] = {}
         # Storage for the last computed FFT frequency vector and magnitude
         # spectra.  These arrays are used both for display and for saving
         # into the TDMS file at merge time.  They are updated in
@@ -126,14 +123,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # Flag used internally to indicate that the FFT enable checkbox is
         # being changed programmatically, preventing reentry in the
-        # associated slot.  Without this guard, toggling the checkbox
-        # after computing the FFT would recursively trigger its handler.
+        # associated slot.
         self._auto_fft_change: bool = False
 
-        # Whether FFT computation is enabled.  When true, the program will
-        # accumulate samples for the duration specified by
-        # _fft_duration_seconds, then compute the FFT once.  After
-        # computation, this flag is reset to False.
+        # Whether FFT computation is enabled.  When true, FFT is computed in
+        # sliding-window mode from the decimated chart data currently visible.
         self._fft_enabled: bool = False
 
         # Directory di salvataggio per la NI‑9234 (nessun cambio dinamico per altri modelli)
@@ -266,10 +260,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         tabPlots.addTab(self.tabInstant, "Blocchi istantanei")
 
         # --------------------------------------------------------------
-        # FFT tab: mostra il modulo della trasformata di Fourier del
-        # blocco istantaneo più recente.  Ogni canale è disegnato con
-        # colore e legenda dedicati.  L'uso di una tab separata evita di
-        # sovraccaricare i grafici istantanei e concatenati.
+        # FFT tab: mostra il modulo della trasformata di Fourier calcolata
+        # sulla finestra temporale del chart concatenato decimato.
+        # Ogni canale è disegnato con colore e legenda dedicati.
         self.tabFFT = QtWidgets.QWidget()
         vfft = QtWidgets.QVBoxLayout(self.tabFFT)
         # Plot widget for the FFT magnitude spectra.  The title will be
@@ -286,10 +279,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         vfft.addWidget(self.pgFFT, 1)
         # Controls for FFT computation: duration and log‑scale toggle
         ctrl_layout = QtWidgets.QHBoxLayout()
-        # Flag to enable or disable FFT computation.  When unchecked,
-        # no FFT is computed and the spectra remain unchanged.  When checked,
-        # the program waits until the specified duration of data has been
-        # accumulated, then computes the FFT once and disables itself.
+        # Enable/disable continuous FFT update from the decimated chart tail.
         self.chkFftEnable = QtWidgets.QCheckBox("Abilita FFT")
         self.chkFftEnable.toggled.connect(self._on_fft_enable_toggled)
         ctrl_layout.addWidget(self.chkFftEnable)
@@ -1599,6 +1589,15 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 self._fft_legend.clear()
         except Exception:
             pass
+        # Remove FFT window markers when plot items are reset.
+        for ln_name in ('_fft_win_line_start', '_fft_win_line_end'):
+            ln = getattr(self, ln_name, None)
+            if ln is not None:
+                try:
+                    self.pgChart.removeItem(ln)
+                except Exception:
+                    pass
+                setattr(self, ln_name, None)
         self._chart_legend.clear()
         self._instant_legend.clear()
 
@@ -1643,7 +1642,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
             # FFT plot: crea una curva per questo canale e aggiungila alla
             # legenda FFT.  Non si applica decimazione o clipping qui perché
-            # l'FFT è già un riassunto del blocco istantaneo.
+            # l'FFT è già un riassunto della finestra selezionata.
             try:
                 cfft = self.pgFFT.plot(name=label, pen=pg.mkPen(color=color, width=1.5))
             except Exception:
@@ -1661,35 +1660,15 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
-        # After creating FFT curves, initialise ring buffers for each active
-        # channel.  The length of the buffer depends on the sampling rate
-        # and the FFT duration.  Reset the storage for the last computed
-        # spectra.  This ensures that a fresh FFT is computed for the new
-        # acquisition.
-        # Determine sampling rate; if unavailable, default to zero (buffers
-        # will be empty until updated when samples arrive).
-        try:
-            fs = float(self.acq.current_rate_hz or 0.0)
-        except Exception:
-            fs = 0.0
-        # Compute maximum samples; ensure at least 2 to allow FFT computation
-        try:
-            maxlen = int(max(2, round(self._fft_duration_seconds * fs))) if fs > 0 else 2
-        except Exception:
-            maxlen = 2
-        # Initialise buffers
-        self._fft_buffers_by_phys = {}
-        for phys in self._current_phys_order:
-            self._fft_buffers_by_phys[phys] = deque(maxlen=maxlen)
-        # Reset last FFT results
+        # Reset last FFT results and title when channels are rebuilt.
         self._last_fft_freq = None
         self._last_fft_mag_by_phys.clear()
-        # Update plot title based on current duration
         try:
             title = f"Spettro FFT (finestra {self._fft_duration_seconds:.3g} s)"
             self.pgFFT.setTitle(title)
         except Exception:
             pass
+        self._update_fft_window_lines()
 
     def _rebuild_legends(self):
         self._chart_legend.clear()
@@ -1733,6 +1712,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         for phys, curve in self._chart_curves_by_phys.items():
             self._chart_y_by_phys[phys].clear()
             curve.clear()
+        self._update_fft_window_lines()
 
     # slot dai segnali (main thread)
     def _slot_instant_block(self, t: np.ndarray, ys: list, names: list):
@@ -1748,15 +1728,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 y_eng = a * np.asarray(y, dtype=float) + b
                 self._instant_y_by_phys[phys] = y_eng
 
-                # Append engineering values to the FFT ring buffer for this channel
-                try:
-                    buf = self._fft_buffers_by_phys.get(phys)
-                    if isinstance(buf, deque) and y_eng.size > 0:
-                        # Extend with raw floats; using tolist() avoids copying the entire
-                        # array when maxlen is small relative to y_eng.size.
-                        buf.extend(float(v) for v in y_eng.tolist())
-                except Exception:
-                    pass
         except RuntimeError:
             pass
 
@@ -1799,221 +1770,203 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         try:
             if hasattr(self, 'lblAvgChart'):
                 avg_strings = []
-                # Usa l'ordine dei canali avviati per mantenere la coerenza
                 for phys in self._current_phys_order:
                     dq = self._chart_y_by_phys.get(phys)
                     if dq and len(dq) > 0:
                         try:
-                            # Converte il deque in array per calcolare la media
                             y_vals = np.fromiter(dq, dtype=float, count=len(dq))
                             if y_vals.size > 0:
                                 avg_val = float(np.mean(y_vals))
-                                # Determina il nome da visualizzare (label al momento dello start) o fallback
                                 label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys))
                                 unit = self._calib_by_phys.get(phys, {}).get('unit', '')
                                 avg_strings.append(f"{label}: {avg_val:.6g}" + (f" {unit}" if unit else ""))
                         except Exception:
                             pass
-                # Aggiorna il testo dell'etichetta con le medie separate da virgola
                 self.lblAvgChart.setText(", ".join(avg_strings) if avg_strings else "")
         except Exception:
             pass
 
-        # Previous FFT computation over a single instant block has been
-        # replaced by a sliding window implementation.  The legacy code
-        # computing the FFT of the last block has been removed in favour
-        # of the implementation above.
+        # Keep FFT window markers aligned to the decimated chart tail.
+        self._update_fft_window_lines()
 
-        # ------------ FFT computation and display ------------
-        # Compute the FFT only when the user has enabled it via the
-        # corresponding checkbox.  When enabled, the program waits until
-        # the ring buffers contain at least the number of samples
-        # corresponding to the requested duration.  Once a full window
-        # has been collected, the FFT is computed once and the checkbox
-        # is automatically cleared.  Previous FFT results remain visible
-        # until a new computation is triggered.
+        if self._fft_enabled:
+            self._compute_fft_from_chart_window()
+
+    def _get_chart_sampling_rate(self) -> float:
+        """
+        Effective sampling rate of the decimated chart.
+        Fs_chart = Fs_raw / dec_step where dec_step is acquisition decimation.
+        """
         try:
-            # Determine sampling rate; skip if unavailable
-            fs = 0.0
-            try:
-                fs = float(self.acq.current_rate_hz or 0.0)
-            except Exception:
-                fs = 0.0
-            if fs > 0.0 and isinstance(self._fft_buffers_by_phys, dict) and self._fft_buffers_by_phys:
-                # Required number of samples for the FFT window
-                try:
-                    required_samples = int(max(1, round(self._fft_duration_seconds * fs)))
-                except Exception:
-                    required_samples = 1
-                if self._fft_enabled:
-                    # Check if we have collected enough samples across channels
-                    enough = False
-                    for phys, buf in self._fft_buffers_by_phys.items():
-                        if not isinstance(buf, deque):
-                            continue
-                        if len(buf) >= required_samples:
-                            enough = True
-                            break
-                    if enough:
-                        # Compute FFT for each channel using the last
-                        # required_samples samples.  Use the length of the
-                        # first eligible buffer to determine the frequency axis.
-                        self._last_fft_freq = None
-                        self._last_fft_mag_by_phys.clear()
-                        peak_strings = []
-                        for phys, buf in self._fft_buffers_by_phys.items():
-                            if not isinstance(buf, deque) or len(buf) < 2:
-                                continue
-                            # Use only the most recent required_samples values
-                            try:
-                                arr = np.fromiter(list(buf)[-required_samples:], dtype=float, count=min(len(buf), required_samples))
-                            except Exception:
-                                continue
-                            N = arr.size
-                            if N < 2:
-                                continue
-                            # Apply window function (Hann)
-                            try:
-                                window = np.hanning(N)
-                                arr_windowed = arr * window
-                            except Exception:
-                                arr_windowed = arr
-                            try:
-                                Y = np.fft.rfft(arr_windowed)
-                                mag = np.abs(Y)
-                            except Exception:
-                                continue
-                            if self._last_fft_freq is None:
-                                try:
-                                    freq = np.fft.rfftfreq(N, d=1.0 / fs)
-                                except Exception:
-                                    freq = None
-                                if isinstance(freq, np.ndarray):
-                                    self._last_fft_freq = freq
-                            self._last_fft_mag_by_phys[phys] = mag
-                            # Update plot curve
-                            try:
-                                curve = self._fft_curves_by_phys.get(phys)
-                                if curve is not None and self._last_fft_freq is not None and mag.size == self._last_fft_freq.size:
-                                    curve.setData(self._last_fft_freq, mag)
-                            except Exception:
-                                pass
-                            # Compute peak for display
-                            try:
-                                if mag.size > 1:
-                                    idx_peak = int(np.argmax(mag[1:])) + 1
-                                    amp_peak = float(mag[idx_peak])
-                                    f_peak = float(self._last_fft_freq[idx_peak]) if self._last_fft_freq is not None else 0.0
-                                    label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys))
-                                    unit = self._calib_by_phys.get(phys, {}).get('unit', '')
-                                    peak_strings.append(f"{label}: {amp_peak:.3g}{(' ' + unit) if unit else ''} @ {f_peak:.3g} Hz")
-                            except Exception:
-                                pass
-                        # Update peak label
-                        try:
-                            self.lblFftPeakInfo.setText("; ".join(peak_strings))
-                        except Exception:
-                            pass
-                        # Disable FFT computation after this run and uncheck the box
-                        try:
-                            self._auto_fft_change = True
-                            self.chkFftEnable.setChecked(False)
-                            self._auto_fft_change = False
-                        except Exception:
-                            # If UI operations fail, at least disable internal flag
-                            self._fft_enabled = False
-                    else:
-                        # Not enough data yet; do not compute, leave previous spectra
-                        pass
-                else:
-                    # FFT disabled: keep previous spectra on display, but
-                    # ensure that curves reflect the last computed FFT if any
-                    if self._last_fft_freq is not None and self._last_fft_mag_by_phys:
-                        peak_strings = []
-                        for phys, mag in self._last_fft_mag_by_phys.items():
-                            try:
-                                curve = self._fft_curves_by_phys.get(phys)
-                                if curve is not None and mag.size == self._last_fft_freq.size:
-                                    curve.setData(self._last_fft_freq, mag)
-                                    # Compute peak for display
-                                    if mag.size > 1:
-                                        idx_peak = int(np.argmax(mag[1:])) + 1
-                                        amp_peak = float(mag[idx_peak])
-                                        f_peak = float(self._last_fft_freq[idx_peak])
-                                        label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys))
-                                        unit = self._calib_by_phys.get(phys, {}).get('unit', '')
-                                        peak_strings.append(f"{label}: {amp_peak:.3g}{(' ' + unit) if unit else ''} @ {f_peak:.3g} Hz")
-                            except Exception:
-                                pass
-                        try:
-                            self.lblFftPeakInfo.setText("; ".join(peak_strings))
-                        except Exception:
-                            pass
-                    # If no previous FFT, clear curves and label
-                    else:
-                        for curve in self._fft_curves_by_phys.values():
-                            try:
-                                curve.clear()
-                            except Exception:
-                                pass
-                        try:
-                            self.lblFftPeakInfo.setText("")
-                        except Exception:
-                            pass
+            fs_raw = float(getattr(self.acq, 'current_rate_hz', 0.0) or 0.0)
         except Exception:
-            # Leave previous FFT results untouched if an error occurs
+            fs_raw = 0.0
+        try:
+            dec_step = int(getattr(self.acq, 'chart_decimation', getattr(self.acq, '_chart_decim', 1)) or 1)
+        except Exception:
+            dec_step = 1
+        dec_step = max(1, dec_step)
+        if fs_raw <= 0.0:
+            return 0.0
+        return fs_raw / float(dec_step)
+
+    def _compute_fft_from_chart_window(self) -> None:
+        """
+        Compute FFT from the same decimated chart window delimited by START/END
+        markers. Chosen behavior: sliding window update while checkbox is active,
+        so FFT always represents the most recent visible chart segment.
+        """
+        fs_chart = self._get_chart_sampling_rate()
+        if fs_chart <= 0.0:
+            return
+
+        n_chart = len(self._chart_x)
+        if n_chart < 2:
+            return
+
+        try:
+            required_samples = int(round(float(self._fft_duration_seconds) * fs_chart))
+        except Exception:
+            required_samples = 0
+        required_samples = max(2, required_samples)
+
+        # Use available samples up to required_samples from the chart tail.
+        window_len = min(required_samples, n_chart)
+        if window_len < 2:
+            return
+
+        # All chart channels should align with chart_x; use shortest tail as guard.
+        lengths = [len(self._chart_y_by_phys.get(phys, ())) for phys in self._current_phys_order]
+        if not lengths:
+            return
+        min_len = min(lengths + [n_chart])
+        if min_len < 2:
+            return
+        window_len = min(window_len, min_len)
+        if window_len < 2:
+            return
+
+        self._last_fft_freq = np.fft.rfftfreq(window_len, d=1.0 / fs_chart)
+        self._last_fft_mag_by_phys.clear()
+        peak_strings = []
+
+        for phys in self._current_phys_order:
+            dq = self._chart_y_by_phys.get(phys)
+            if not dq or len(dq) < window_len:
+                continue
+            try:
+                arr = np.fromiter(list(dq)[-window_len:], dtype=float, count=window_len)
+            except Exception:
+                continue
+            if arr.size < 2:
+                continue
+
+            # Hann window reduces spectral leakage and keeps FFT consistent.
+            try:
+                arr = arr * np.hanning(arr.size)
+            except Exception:
+                pass
+
+            try:
+                mag = np.abs(np.fft.rfft(arr))
+            except Exception:
+                continue
+
+            self._last_fft_mag_by_phys[phys] = mag
+            curve = self._fft_curves_by_phys.get(phys)
+            if curve is not None and mag.size == self._last_fft_freq.size:
+                try:
+                    curve.setData(self._last_fft_freq, mag)
+                except Exception:
+                    pass
+
+            if mag.size > 1:
+                idx_peak = int(np.argmax(mag[1:])) + 1
+                amp_peak = float(mag[idx_peak])
+                f_peak = float(self._last_fft_freq[idx_peak])
+                label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys))
+                unit = self._calib_by_phys.get(phys, {}).get('unit', '')
+                peak_strings.append(f"{label}: {amp_peak:.3g}{(' ' + unit) if unit else ''} @ {f_peak:.3g} Hz")
+
+        # Clear channels that were not computed in this cycle.
+        for phys, curve in self._fft_curves_by_phys.items():
+            if phys not in self._last_fft_mag_by_phys:
+                try:
+                    curve.clear()
+                except Exception:
+                    pass
+
+        try:
+            self.lblFftPeakInfo.setText("; ".join(peak_strings))
+        except Exception:
             pass
 
-    # -------------------------------------------------------------------------
-    # FFT helper methods
-    # -------------------------------------------------------------------------
-    def _update_fft_buffers_length(self) -> None:
-        """
-        Resize the per‑channel FFT ring buffers to match the current sampling
-        rate and FFT window duration.  This method should be called whenever
-        the sampling rate or the FFT duration changes.  Existing samples
-        are preserved where possible by copying the most recent values into
-        the new buffer.
-        """
+    def _set_fft_window_lines_visible(self, visible: bool) -> None:
         try:
-            fs = float(self.acq.current_rate_hz or 0.0)
+            if self._fft_win_line_start is not None:
+                self._fft_win_line_start.setVisible(visible)
+            if self._fft_win_line_end is not None:
+                self._fft_win_line_end.setVisible(visible)
         except Exception:
-            fs = 0.0
-        if fs <= 0.0:
-            return
-        # Compute maximum number of samples for the FFT window
-        try:
-            maxlen = int(max(2, round(self._fft_duration_seconds * fs)))
-        except Exception:
-            maxlen = 2
-        # Resize each buffer preserving recent samples
-        for phys, buf in list(self._fft_buffers_by_phys.items()):
+            pass
+
+    def _update_fft_window_lines(self) -> None:
+        """
+        Update START/END markers over the decimated chart.
+        END is the latest chart sample time; START = END - FFT_duration.
+        """
+        if self._fft_win_line_start is None or self._fft_win_line_end is None:
             try:
-                # Copy last maxlen samples into a new deque
-                recent = list(buf)[-maxlen:] if isinstance(buf, deque) else []
-                self._fft_buffers_by_phys[phys] = deque(recent, maxlen=maxlen)
+                pen = pg.mkPen(color=(255, 255, 0), width=1.6, style=QtCore.Qt.DashLine)
+                self._fft_win_line_start = pg.InfiniteLine(angle=90, movable=False, pen=pen)
+                self._fft_win_line_end = pg.InfiniteLine(angle=90, movable=False, pen=pen)
+                self.pgChart.addItem(self._fft_win_line_start)
+                self.pgChart.addItem(self._fft_win_line_end)
             except Exception:
-                # On failure, create a fresh empty buffer
-                self._fft_buffers_by_phys[phys] = deque(maxlen=maxlen)
+                self._fft_win_line_start = None
+                self._fft_win_line_end = None
+                return
+
+        if not self._fft_enabled:
+            self._set_fft_window_lines_visible(False)
+            return
+
+        n_chart = len(self._chart_x)
+        if n_chart < 1:
+            self._set_fft_window_lines_visible(False)
+            return
+
+        try:
+            x_end = float(self._chart_x[-1])
+        except Exception:
+            self._set_fft_window_lines_visible(False)
+            return
+        x_start = x_end - float(self._fft_duration_seconds)
+
+        try:
+            self._fft_win_line_end.setPos(x_end)
+            self._fft_win_line_start.setPos(x_start)
+            self._set_fft_window_lines_visible(True)
+        except Exception:
+            pass
 
     def _on_fft_duration_changed(self, value: float) -> None:
         """
-        Slot called when the user changes the FFT window duration via the
-        spin box.  Updates the internal setting and resizes the ring
-        buffers accordingly.
+        Slot called when the user changes FFT duration. It updates markers and,
+        if FFT is enabled, recomputes immediately from the chart decimated tail.
         """
         try:
             self._fft_duration_seconds = float(value)
         except Exception:
             self._fft_duration_seconds = 1.0
-        # Resize buffers based on the new duration
-        self._update_fft_buffers_length()
-        # Optionally update the FFT plot title to reflect the new duration
         try:
             title = f"Spettro FFT (finestra {self._fft_duration_seconds:.3g} s)"
             self.pgFFT.setTitle(title)
         except Exception:
             pass
+        self._update_fft_window_lines()
+        if self._fft_enabled:
+            self._compute_fft_from_chart_window()
 
     def _on_fft_log_scale_changed(self, checked: bool) -> None:
         """
@@ -2031,40 +1984,31 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     def _on_fft_enable_toggled(self, checked: bool) -> None:
         """
-        Slot invoked when the user toggles the FFT enable checkbox.  When
-        enabled, the ring buffers for all channels are cleared so that
-        subsequent samples correspond exactly to the requested FFT window.
-        Once a complete window has been collected, the FFT will be
-        computed exactly once and the checkbox will be cleared
-        automatically.  When disabled, any pending FFT computation is
-        cancelled.
+        Enable/disable FFT over decimated chart data.
+
+        Semantics choice: sliding-window mode (preferred). As soon as FFT is
+        enabled, if enough chart history already exists, spectrum is computed
+        immediately; then it keeps updating while new chart points arrive.
         """
-        # Avoid recursion when programmatically changing the checkbox
         if getattr(self, '_auto_fft_change', False):
             return
         self._fft_enabled = bool(checked)
+        self._update_fft_window_lines()
         if self._fft_enabled:
-            # Clear existing buffers so that the FFT uses samples acquired
-            # after enabling.  This ensures the time window matches the
-            # duration specified by the user.
+            # Clear previous spectra so the next display corresponds only to
+            # the current chart-driven window selection.
+            self._last_fft_freq = None
+            self._last_fft_mag_by_phys.clear()
+            for curve in self._fft_curves_by_phys.values():
+                try:
+                    curve.clear()
+                except Exception:
+                    pass
             try:
-                for buf in self._fft_buffers_by_phys.values():
-                    if isinstance(buf, deque):
-                        buf.clear()
+                self.lblFftPeakInfo.setText("")
             except Exception:
                 pass
-            # Recompute buffer length in case the sampling rate or duration
-            # has changed since the last initialisation.  This keeps the
-            # ring buffer size consistent with the current settings.
-            try:
-                self._update_fft_buffers_length()
-            except Exception:
-                pass
-        else:
-            # When disabled, simply ignore any pending computation.  The
-            # previous FFT result remains visible until a new FFT is
-            # computed.
-            pass
+            self._compute_fft_from_chart_window()
 
     # ----------------------------- Definisci Tipo Risorsa -----------------------------
     def _open_resource_manager(self):
