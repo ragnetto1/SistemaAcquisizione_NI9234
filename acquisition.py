@@ -1,4 +1,4 @@
-﻿# Data/Ora: 2026-02-12 10:15:59
+﻿# Data/Ora: 2026-02-12 15:14:36
 # acquisition.py
 import os, math, time, uuid, queue, threading, tempfile, datetime
 from typing import List, Callable, Optional, Dict, Any, Tuple
@@ -31,19 +31,19 @@ def _align_up(value: int, base: int) -> int:
 
 class AcquisitionManager:
     """
-    Core specifico per la scheda NIâ€‘9234 con:
-      â€¢ stream continuo Every N Samples
-      â€¢ grafici decimati
-      â€¢ writer TDMS a rotazione (default 60Â s) SENZA PERDITE (sampleâ€‘accurate)
-      â€¢ scrittura streaming (miniâ€‘segmenti) a RAM costante
-      â€¢ tempo continuo in ogni file e proprietÃ  ``wf_*`` coerenti
-      â€¢ stop_graceful: svuota il buffer driver e salva il residuo
+    Core specifico per la scheda NI‑9234 con:
+      • stream continuo Every N Samples
+      • grafici decimati
+      • writer TDMS a rotazione (default 60 s) SENZA PERDITE (sample‑accurate)
+      • scrittura streaming (mini‑segmenti) a RAM costante
+      • tempo continuo in ogni file e proprietà ``wf_*`` coerenti
+      • stop_graceful: svuota il buffer driver e salva il residuo
 
-    Questo gestore Ã¨ progettato esclusivamente per la NIâ€‘9234, che dispone
-    di quattro ingressi analogici simultanei con range Â±5Â V e frequenza
-    massima di circa 51,2Â kS/s per canaleã€990734219581306â€ L226-L234ã€‘.
-    Il supporto per la NIâ€‘9201 Ã¨ stato rimosso in questo progetto per
-    semplificare la configurazione e lâ€™uso.
+    Questo gestore è progettato esclusivamente per la NI‑9234, che dispone
+    di quattro ingressi analogici simultanei con range ±5 V e frequenza
+    massima di circa 51,2 kS/s per canale【990734219581306†L226-L234】.
+    Il supporto per la NI‑9201 è stato rimosso in questo progetto per
+    semplificare la configurazione e l’uso.
     """
 
     def __init__(self, sample_rate=10000.0, callback_chunk=1000, rotate_seconds=60, board_type: str = "NI9234"):
@@ -53,24 +53,24 @@ class AcquisitionManager:
         Parameters
         ----------
         sample_rate : float, optional
-            Desired perâ€‘channel sampling rate in Hz. Defaults to 10Â kS/s. The actual
+            Desired per‑channel sampling rate in Hz. Defaults to 10 kS/s. The actual
             sampling rate will be clamped to the maximum supported by the
-            NIâ€‘9234 (51.2Â kS/s per channelã€990734219581306â€ L226-L234ã€‘).
+            NI‑9234 (51.2 kS/s per channel【990734219581306†L226-L234】).
         callback_chunk : int, optional
             Number of samples per channel to read in each callback. Must be a
             positive integer. Defaults to 1000.
         rotate_seconds : int, optional
             Duration (in seconds) of each TDMS file segment before rotation.
-            Defaults to 60Â s.
+            Defaults to 60 s.
         board_type : str, optional
             Ignored parameter retained for backwards compatibility; the
-            acquisition is always configured for the NIâ€‘9234.
+            acquisition is always configured for the NI‑9234.
         """
-        # Always use NIâ€‘9234; ignore the board_type argument.  Retain the
+        # Always use NI‑9234; ignore the board_type argument.  Retain the
         # attribute for compatibility with existing interfaces, but do not
-        # attempt to autoâ€‘detect or support other devices in this project.
+        # attempt to auto‑detect or support other devices in this project.
         self.board_type = "NI9234"
-        # Perâ€‘channel sampling rate requested by user (before clamping to hardware).
+        # Per‑channel sampling rate requested by user (before clamping to hardware).
         self.sample_rate = float(sample_rate)
         self.callback_chunk = int(callback_chunk)
         self.rotate_seconds = int(rotate_seconds)
@@ -94,7 +94,7 @@ class AcquisitionManager:
 
         # temp_dir is initialised at the top of __init__ based on board_type.
 
-        # Fixed configuration for NIâ€‘9234: four channels, Â±5Â V range.
+        # Fixed configuration for NI‑9234: four channels, ±5 V range.
         self.num_channels = 4
         self.default_range: Tuple[float, float] = (-5.0, 5.0)
 
@@ -106,7 +106,7 @@ class AcquisitionManager:
         # Store the most recent raw value (voltage) per physical channel.
         self._last_raw: Dict[str, Optional[float]] = {f"ai{i}": None for i in range(self.num_channels)}
 
-        # Perâ€‘channel configuration: coupling and physical limits.
+        # Per‑channel configuration: coupling and physical limits.
         # Example entry: {"ai0": {"coupling": "IEPE + AC", "min_input": -20.0, "max_input": 20.0}}
         self._channel_config: Dict[str, Dict[str, Any]] = {}
 
@@ -155,7 +155,7 @@ class AcquisitionManager:
         # initialization, the writer flush routine would fail with an
         # attribute error if recording is enabled.
         try:
-            # Use a prefix to identify that this directory belongs to a NIâ€‘9234 acquisition
+            # Use a prefix to identify that this directory belongs to a NI‑9234 acquisition
             temp_base = tempfile.gettempdir()
             unique = f"ni9234_acq_{uuid.uuid4().hex}"
             self.temp_dir = os.path.abspath(os.path.join(temp_base, unique))
@@ -234,7 +234,7 @@ class AcquisitionManager:
             # The queue may be unbounded; qsize gives an estimate of items
             queued_blocks = int(getattr(q, "qsize", lambda: 0)())
             backlog_bytes = queued_blocks * block_bytes
-            # Include any inâ€‘memory buffer that has not yet been flushed
+            # Include any in‑memory buffer that has not yet been flushed
             backlog_bytes += int(self._memory_bytes or 0)
             return backlog_bytes / float(1024 * 1024)
         except Exception:
@@ -329,7 +329,7 @@ class AcquisitionManager:
     def set_channel_config(self, phys_name: str, coupling: Optional[str] = None,
                            min_input: Optional[float] = None, max_input: Optional[float] = None) -> None:
         """
-        Store perâ€‘channel configuration for the given physical channel. This
+        Store per‑channel configuration for the given physical channel. This
         information includes the requested coupling type (e.g. 'DC', 'AC',
         'IEPE + AC') and the physical minimum/maximum input limits. The
         physical limits are expressed in the unit associated with the selected
@@ -366,7 +366,7 @@ class AcquisitionManager:
 
     # -------------------- Scoperta / limiti modulo --------------------
     def list_ni9201_devices(self) -> List[str]:
-        """Versione tollerante: include moduli simulati anche quando product_type Ã¨ vuoto."""
+        """Versione tollerante: include moduli simulati anche quando product_type è vuoto."""
         if System is None:
             return []
         found = []
@@ -415,7 +415,7 @@ class AcquisitionManager:
                 # simulato?
                 is_sim = bool(getattr(dev, "is_simulated", False))
 
-                # chassis: prima prova con property, poi fallback sul prefisso 'cDAQxMody' â†’ 'cDAQx'
+                # chassis: prima prova con property, poi fallback sul prefisso 'cDAQxMody' → 'cDAQx'
                 ch_name = ""
                 try:
                     ch = getattr(dev, "chassis_device", None)
@@ -437,11 +437,11 @@ class AcquisitionManager:
 
     def list_ni9234_devices(self) -> List[str]:
         """
-        Return a list of NIâ€‘9234 device names. The search is tolerant and
+        Return a list of NI‑9234 device names. The search is tolerant and
         matches both real and simulated modules. It uses both the product_type
         property and a heuristic on the number of analog input channels. A
-        NIâ€‘9234 module has four analog inputs. This method returns an empty
-        list if the NIâ€‘DAQmx system API is unavailable.
+        NI‑9234 module has four analog inputs. This method returns an empty
+        list if the NI‑DAQmx system API is unavailable.
         """
         if System is None:
             return []
@@ -465,9 +465,9 @@ class AcquisitionManager:
 
     def list_ni9234_devices_meta(self) -> List[Dict[str, Any]]:
         """
-        Return robust metadata for NIâ€‘9234 modules (real or simulated).
+        Return robust metadata for NI‑9234 modules (real or simulated).
         Each element is a dict with keys: name, product_type, is_simulated,
-        and chassis. This method returns an empty list if the NIâ€‘DAQmx
+        and chassis. This method returns an empty list if the NI‑DAQmx
         system API is unavailable.
         """
         if System is None:
@@ -478,7 +478,7 @@ class AcquisitionManager:
                 name = getattr(dev, "name", "")
                 pt = (getattr(dev, "product_type", "") or "")
                 pt_u = pt.upper()
-                # A NIâ€‘9234 has product_type containing '9234' or exactly four analog channels.
+                # A NI‑9234 has product_type containing '9234' or exactly four analog channels.
                 try:
                     n_ai = len(getattr(dev, "ai_physical_chans", []))
                 except Exception:
@@ -507,9 +507,9 @@ class AcquisitionManager:
 
     def list_current_devices_meta(self) -> List[Dict[str, Any]]:
         """
-        Return metadata for NIâ€‘9234 modules (real or simulated).  This
+        Return metadata for NI‑9234 modules (real or simulated).  This
         method always returns the result of ``list_ni9234_devices_meta`` because
-        the NIâ€‘9234 is the only supported device in this project.
+        the NI‑9234 is the only supported device in this project.
         """
         return self.list_ni9234_devices_meta()
 
@@ -526,8 +526,8 @@ class AcquisitionManager:
         self.max_multi_rate_hz = None
         dev = self._get_device_by_name(device_name)
         # Fallback when the device cannot be queried (e.g. simulation only).
-        # For the NIâ€‘9234 the maximum perâ€‘channel rate is 51.2Â kS/s and the
-        # aggregate rate is four times higher (simultaneous sampling)ã€990734219581306â€ L226-L234ã€‘.
+        # For the NI‑9234 the maximum per‑channel rate is 51.2 kS/s and the
+        # aggregate rate is four times higher (simultaneous sampling)【990734219581306†L226-L234】.
         if dev is None:
             self.max_single_rate_hz = 51_200.0
             self.max_multi_rate_hz = 51_200.0 * max(1, self.num_channels)
@@ -660,7 +660,7 @@ class AcquisitionManager:
                     coupl_str = str(cfg.get("coupling", "") or "").strip().upper()
                     if self.board_type and "9234" in self.board_type.upper() and coupl_str:
                         if _nidaq_const is not None:
-                            # Map user coupling string to NIâ€‘DAQmx Coupling enum.
+                            # Map user coupling string to NI‑DAQmx Coupling enum.
                             if "IEPE" in coupl_str:
                                 # IEPE implies AC coupling and internal current excitation.
                                 try:
@@ -782,7 +782,7 @@ class AcquisitionManager:
             while (time.time() - t0) * 1000.0 < wait_ms:
                 time.sleep(0.005)
 
-            # drena il buffer hardware con lettura sincrona finchÃ© ci sono campioni
+            # drena il buffer hardware con lettura sincrona finché ci sono campioni
             try:
                 avail = int(self._task.in_stream.avail_samp_per_chan)
             except Exception:
@@ -803,7 +803,7 @@ class AcquisitionManager:
                 except Exception:
                     break
 
-            # da qui in poi non vogliamo piÃ¹ callback
+            # da qui in poi non vogliamo più callback
             self._unregister_callbacks()
             time.sleep(0.01)
 
@@ -843,7 +843,7 @@ class AcquisitionManager:
 
     # -------------------- Callback DAQ --------------------
     def _on_every_n_samples(self, task_handle, every_n_samples_event_type, number_of_samples, callback_data):
-        # Uscita rapida se stiamo chiudendo o il task/reader non Ã¨ piÃ¹ valido
+        # Uscita rapida se stiamo chiudendo o il task/reader non è più valido
         if (not self._running) or self._closing or (self._task is None) or (self._reader is None):
             return 0
         try:
@@ -862,14 +862,14 @@ class AcquisitionManager:
                 fs = float(self.current_rate_hz or 1.0)
                 self._t0_epoch_s = (ts_ns / 1e9) - (number_of_samples / fs)
 
-            # nomi â€œfreezeâ€ allo start (se non presenti, fallback ai fisici)
+            # nomi “freeze” allo start (se non presenti, fallback ai fisici)
             start_names = list(self._start_channel_names or self._ai_channels or [])
             if len(start_names) < nch:
                 start_names += [self._ai_channels[i] for i in range(len(start_names), nch)]
             elif len(start_names) > nch:
                 start_names = start_names[:nch]
 
-            # ultimo valore + zero + calibrazione â†’ verso UI con nomi di start
+            # ultimo valore + zero + calibrazione → verso UI con nomi di start
             for i, ch in enumerate(self._ai_channels):
                 raw_val = float(buf[i, -1])
                 self._last_raw[ch] = raw_val
@@ -892,7 +892,7 @@ class AcquisitionManager:
                         # Non fermare l'acquisizione per un problema lato UI
                         print("Callback warning (channel_value):", e)
 
-            # enqueue blocco (LOSSY: se pieno, droppa il piÃ¹ vecchio)
+            # enqueue blocco (LOSSY: se pieno, droppa il più vecchio)
             start_idx = self._global_samples
             self._global_samples += number_of_samples
             try:
@@ -907,7 +907,7 @@ class AcquisitionManager:
                 try:
                     self._queue.put_nowait((start_idx, buf))
                 except queue.Full:
-                    # ancora piena â‡’ droppa il blocco corrente
+                    # ancora piena ⇒ droppa il blocco corrente
                     print("Callback warning: queue full; dropped block (also dropped_oldest=%d)" % dropped_old)
 
             # feed grafico (nomi di start, tempo corretto)
@@ -960,7 +960,7 @@ class AcquisitionManager:
         configurable limit (default 500 MB). Once the limit is reached or
         recording is stopped, the accumulated blocks are flushed to a new
         TDMS file. This approach guarantees that no samples are lost while
-        providing larger segment files instead of the timeâ€‘based rotation.
+        providing larger segment files instead of the time‑based rotation.
         """
         # Sample rate for time calculations
         fs = float(self.current_rate_hz or 1.0)
@@ -969,9 +969,9 @@ class AcquisitionManager:
         def flush_memory():
             """
             Writes all accumulated blocks to a new TDMS file and clears the
-            inâ€‘memory buffer. Blocks are sorted by their global start index
+            in‑memory buffer. Blocks are sorted by their global start index
             to maintain chronological order. Each block is written as a
-            miniâ€‘segment with appropriate metadata. If the output directory
+            mini‑segment with appropriate metadata. If the output directory
             has been removed (e.g. after merging) or is unset, no file is
             written and the accumulated blocks are simply discarded.
             """
@@ -1052,7 +1052,7 @@ class AcquisitionManager:
                             continue
                         if n <= 0:
                             continue
-                        # Compute relative time vector for this miniâ€‘segment
+                        # Compute relative time vector for this mini‑segment
                         try:
                             t_rel = (start_in_file / fs) + (np.arange(n, dtype=np.float64) / fs)
                         except Exception:
@@ -1142,7 +1142,7 @@ class AcquisitionManager:
                                     print(f"Writer warning (data channel {i}):", e)
                         except Exception as e:
                             print("Writer error (data channels build):", e)
-                        # Write the miniâ€‘segment
+                        # Write the mini‑segment
                         try:
                             writer.write_segment([root, group] + channels)
                         except Exception as e:
@@ -1171,7 +1171,7 @@ class AcquisitionManager:
                 if not self._recording_enabled:
                     if self._memory_bytes > 0:
                         flush_memory()
-                    # Drain the queue to avoid memory buildâ€‘up
+                    # Drain the queue to avoid memory build‑up
                     while True:
                         try:
                             _ = self._queue.get_nowait()
@@ -1243,7 +1243,7 @@ class AcquisitionManager:
 
     def get_last_engineered(self, phys_chan: str) -> Optional[float]:
         """
-        Valore istantaneo in unitÃ  ingegneristiche, applicando zero (shift) e a*x+b.
+        Valore istantaneo in unità ingegneristiche, applicando zero (shift) e a*x+b.
         """
         raw = self._last_raw.get(phys_chan)
         if raw is None:
@@ -1326,7 +1326,7 @@ class AcquisitionManager:
         - Aggiunge suffissi _2, _3, ... se necessario
         """
         unique = []
-        used = set(["Time"])  # 'Time' Ã¨ riservato
+        used = set(["Time"])  # 'Time' è riservato
         counters = {}
         for raw in (ui_names or []):
             base = self._sanitize_tdms_basename(raw)
@@ -1355,5 +1355,6 @@ class AcquisitionManager:
             src = self._channel_names or self._ai_channels
             return self._unique_tdms_names(list(src))
         except Exception:
-            # fallback estremo: nomi fisici cosÃ¬ come sono
+            # fallback estremo: nomi fisici così come sono
             return list(self._ai_channels)
+

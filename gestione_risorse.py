@@ -1,4 +1,4 @@
-﻿# Data/Ora: 2026-02-12 10:15:59
+﻿# Data/Ora: 2026-02-12 15:14:36
 import os
 import xml.etree.ElementTree as ET
 from typing import List, Optional, Tuple
@@ -13,7 +13,7 @@ XML_ROOT = "Sensors"
 XML_ITEM = "Sensor"
 XML_NAME = "NomeRisorsa"
 XML_UNIT = "GrandezzaFisica"
-# vecchio schema (retro-compatibilitÃ  in lettura)
+# vecchio schema (retro-compatibilità in lettura)
 XML_V1V = "Valore1Volt"
 XML_V1  = "Valore1"
 XML_V2V = "Valore2Volt"
@@ -55,12 +55,12 @@ def get_sensor_names(xml_path: str) -> List[str]:
 class ResourceManagerDialog(QtWidgets.QDialog):
     """
     Editor per un sensore alla volta con punti:
-      [Misura] [Volt] [Valore (unitÃ )] [Elimina]
+      [Misura] [Volt] [Valore (unità)] [Elimina]
     Grafico live (punti + retta best-fit) e salvataggio XML.
     """
     def __init__(self, acq_manager, xml_path: Optional[str] = None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Definisci Tipo Risorsa â€” Editor sensore")
+        self.setWindowTitle("Definisci Tipo Risorsa — Editor sensore")
         self.resize(780, 640)
 
         self.acq = acq_manager
@@ -88,7 +88,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
         # riga file DB
         top = QtWidgets.QHBoxLayout()
         self.txtPath = QtWidgets.QLineEdit(self.xml_path)
-        self.btnBrowse = QtWidgets.QPushButton("Sfogliaâ€¦")
+        self.btnBrowse = QtWidgets.QPushButton("Sfoglia…")
         self.btnNewFile = QtWidgets.QPushButton("Genera nuovo file")
         self.btnReload = QtWidgets.QPushButton("Ricarica")
         top.addWidget(QtWidgets.QLabel("Sensor DB:"))
@@ -116,7 +116,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
         form.addWidget(self.txtSupportedDAQ, r, 1, 1, 3)
         r += 1
 
-        # Grandezza fisica (unitÃ )
+        # Grandezza fisica (unità)
         self.txtUnit = QtWidgets.QLineEdit()
         form.addWidget(QtWidgets.QLabel("Grandezza fisica"), r, 0)
         form.addWidget(self.txtUnit, r, 1, 1, 3)
@@ -141,7 +141,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
         header.setHorizontalSpacing(16)
         header.addWidget(QtWidgets.QLabel(""), 0, 0)  # per il bottone Misura
         lblV = QtWidgets.QLabel("Volt")
-        lblX = QtWidgets.QLabel("Valore (unitÃ )")
+        lblX = QtWidgets.QLabel("Valore (unità)")
         font_b = lblV.font(); font_b.setBold(True)
         lblV.setFont(font_b); lblX.setFont(font_b)
         header.addWidget(lblV, 0, 1)
@@ -242,7 +242,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
         self._rows.append((btnM, spinV, spinX, lblVoltUnit, lblValUnit, btnDel))
 
     def _delete_row(self, tup):
-        """Rimuove una riga (senza salvare sul DB finchÃ© non premi 'Applica valori')."""
+        """Rimuove una riga (senza salvare sul DB finché non premi 'Applica valori')."""
         try:
             idx = self._rows.index(tup)
         except ValueError:
@@ -283,7 +283,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
 
     def _measure_into_widget(self, spinV: QtWidgets.QDoubleSpinBox):
         ch = self.cmbChannel.currentText().strip()
-        # Se il canale non Ã¨ abilitato nell'acquisizione principale, chiedi all'utente se abilitarlo
+        # Se il canale non è abilitato nell'acquisizione principale, chiedi all'utente se abilitarlo
         parent_win = None
         try:
             parent_win = self.parent()
@@ -294,7 +294,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
                 if not parent_win.is_channel_enabled(ch):
                     res = QtWidgets.QMessageBox.question(
                         self, "Canale non abilitato",
-                        f"Il canale {ch} non Ã¨ abilitato, vuoi abilitarlo per prendere la misura?",
+                        f"Il canale {ch} non è abilitato, vuoi abilitarlo per prendere la misura?",
                         QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                         QtWidgets.QMessageBox.Yes)
                     if res == QtWidgets.QMessageBox.Yes:
@@ -318,7 +318,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Attenzione", "Nessun valore disponibile (acquisizione non attiva?).")
             return
         try:
-            spinV.setValue(float(val))  # triggerÃ  _update_plot via valueChanged
+            spinV.setValue(float(val))  # triggerà _update_plot via valueChanged
         except Exception:
             pass
 
@@ -364,8 +364,8 @@ class ResourceManagerDialog(QtWidgets.QDialog):
                 xs = np.linspace(vmin, vmax, 200)
                 ys = a * xs + b
                 self.line.setData(xs, ys)
-                sign = "+" if b >= 0 else "âˆ’"
-                title = f"Best-fit: y = {a:.6g}Â·V {sign} {abs(b):.6g}"
+                sign = "+" if b >= 0 else "−"
+                title = f"Best-fit: y = {a:.6g}·V {sign} {abs(b):.6g}"
             else:
                 self.line.setData([], [])
         else:
@@ -406,9 +406,9 @@ class ResourceManagerDialog(QtWidgets.QDialog):
         self.cmbName.setEditText("New")  # per creare un nuovo sensore
         self.cmbName.blockSignals(False)
         self.txtUnit.setText("")
-        # Imposta il campo supportedDAQ al valore predefinito quando non Ã¨ selezionato alcun sensore
+        # Imposta il campo supportedDAQ al valore predefinito quando non è selezionato alcun sensore
         try:
-            # Il valore predefinito include i modelli NI9201 e NI9202 per compatibilitÃ  futura
+            # Il valore predefinito include i modelli NI9201 e NI9202 per compatibilità futura
             self.txtSupportedDAQ.setText("NI9201,NI9202")
         except Exception:
             pass
@@ -440,7 +440,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
                 sens = s; break
         if sens is None:
             return
-        # unitÃ 
+        # unità
         self.txtUnit.setText(sens.findtext(XML_UNIT, default=""))
         # supportedDAQ: stringa con la lista dei modelli compatibili
         try:
@@ -449,7 +449,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
                 # Mostra il valore esistente
                 self.txtSupportedDAQ.setText(sup)
             else:
-                # Se non Ã¨ definito, imposta il valore predefinito
+                # Se non è definito, imposta il valore predefinito
                 self.txtSupportedDAQ.setText("NI9201,NI9202")
         except Exception:
             # In caso di eccezione lascio il default
@@ -536,7 +536,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
             if old is not None:
                 found.remove(old)
 
-        # Rimuovi unitÃ  e supportedDAQ se giÃ  presenti (verranno reinseriti in ordine)
+        # Rimuovi unità e supportedDAQ se già presenti (verranno reinseriti in ordine)
         try:
             old_sup = found.find(XML_SUPPORTED_DAQ)
             if old_sup is not None:
@@ -552,7 +552,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
 
         # Crea elementi unit e supportedDAQ con il valore corrente
         sup_elem = ET.Element(XML_SUPPORTED_DAQ)
-        # Se il campo Ã¨ vuoto, usa la stringa predefinita con NI9201 e NI9202
+        # Se il campo è vuoto, usa la stringa predefinita con NI9201 e NI9202
         sup_elem.text = supported_daq_text if supported_daq_text else "NI9201,NI9202"
         unit_elem = ET.Element(XML_UNIT)
         unit_elem.text = unit
@@ -575,7 +575,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
         except Exception:
             pass
         if not inserted:
-            # Se NomeRisorsa non Ã¨ stato trovato, aggiungi alla fine
+            # Se NomeRisorsa non è stato trovato, aggiungi alla fine
             found.append(sup_elem)
             found.append(unit_elem)
 
@@ -592,14 +592,15 @@ class ResourceManagerDialog(QtWidgets.QDialog):
 
         try:
             tree.write(self.xml_path, encoding="utf-8", xml_declaration=True)
-            sign = "+" if b >= 0 else "âˆ’"
+            sign = "+" if b >= 0 else "−"
             QtWidgets.QMessageBox.information(
                 self, "Salvato",
-                f"Salvato \"{name}\"  â€” unitÃ : {unit}  |  best-fit: y = {a:.6g}Â·V {sign} {abs(b):.6g}"
+                f"Salvato \"{name}\"  — unità: {unit}  |  best-fit: y = {a:.6g}·V {sign} {abs(b):.6g}"
             )
             self._refresh_names()
             self.cmbName.setEditText(name)
             self._update_plot()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Errore", f"Impossibile salvare:\n{e}")
+
 

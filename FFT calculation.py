@@ -1,0 +1,335 @@
+﻿# Data/Ora: 2026-02-12 15:14:36
+from PyQt5 import QtCore
+import glob
+import os
+import shutil
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+
+
+DEFAULT_SAVE_DIR = r"C:\UG-WORK\SistemaAcquisizione_NI9234"
+
+
+class FFTDiskWorker(QtCore.QObject):
+    sigStatus = QtCore.pyqtSignal(str)
+    sigResult = QtCore.pyqtSignal(object, object, object)  # (freq, mag_by_phys, peak_text)
+    sigGuardrail = QtCore.pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._duration_s: float = 5.0
+        self._save_dir: str = DEFAULT_SAVE_DIR
+        self._phys_order: List[str] = []
+        self._chunk_dir: str = ""
+        self._window_idx: int = 0
+        self._chunk_idx: int = 0
+        self._window_chunk_files: List[str] = []
+        self._window_samples: int = 0
+        self._chunk_fs_est: float = 0.0
+        self._cfg_fs_hz: float = 0.0
+        self._fallback_used = False
+
+    def _get_chunk_dir(self) -> str:
+        base = self._save_dir or DEFAULT_SAVE_DIR
+        return os.path.join(base, "_fft_chunks")
+
+    def _ensure_chunk_dir(self) -> bool:
+        d = self._get_chunk_dir()
+        try:
+            os.makedirs(d, exist_ok=True)
+            self._chunk_dir = d
+            return True
+        except Exception:
+            pass
+        try:
+            fb = os.path.join(os.environ.get("TEMP", os.getcwd()), "SistemaAcquisizione_FFT", "_fft_chunks")
+            os.makedirs(fb, exist_ok=True)
+            self._chunk_dir = fb
+            if not self._fallback_used:
+                self._fallback_used = True
+                self.sigGuardrail.emit(f"FFT worker fallback path: {fb}")
+            return True
+        except Exception as e:
+            self.sigGuardrail.emit(f"FFT worker: impossibile creare cartella chunk ({e})")
+            return False
+
+    def _estimate_fs(self, t: np.ndarray) -> float:
+        if not isinstance(t, np.ndarray) or t.size < 2:
+            return 0.0
+        try:
+            dt = np.diff(t)
+            dt = dt[np.isfinite(dt) & (dt > 0.0)]
+            if dt.size < 1:
+                return 0.0
+            fs = 1.0 / float(np.median(dt))
+            return fs if np.isfinite(fs) and fs > 0.0 else 0.0
+        except Exception:
+            return 0.0
+
+    def _effective_fs(self) -> float:
+        if self._chunk_fs_est > 0.0:
+            return float(self._chunk_fs_est)
+        if self._cfg_fs_hz > 0.0:
+            return float(self._cfg_fs_hz)
+        return 0.0
+
+    def _compute_fft_mag(self, x: np.ndarray, fs: float) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if not isinstance(x, np.ndarray):
+            return None, None
+        n = int(x.size)
+        if n < 64 or fs <= 0.0:
+            return None, None
+        nfft = 1 << int(np.floor(np.log2(max(64, n))))
+        if nfft < 64:
+            return None, None
+        seg = np.asarray(x[:nfft], dtype=np.float64, copy=False)
+        seg = seg - float(np.mean(seg))
+        win = np.hanning(nfft).astype(np.float64, copy=False)
+        w_sum = float(np.sum(win))
+        if w_sum <= 0.0:
+            return None, None
+        spec = np.fft.rfft(seg * win)
+        mag = (2.0 / w_sum) * np.abs(spec)
+        freq = np.fft.rfftfreq(nfft, d=1.0 / fs)
+        return freq, mag
+
+    def _duration_label(self) -> str:
+        d = max(0.1, float(self._duration_s))
+        if abs(d - round(d)) < 1e-9:
+            return str(int(round(d)))
+        return str(d).replace(".", "_")
+
+    def _cleanup_window_chunks(self) -> None:
+        for p in list(self._window_chunk_files):
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        self._window_chunk_files = []
+
+    def _reset_window_state(self) -> None:
+        self._window_samples = 0
+        self._chunk_idx = 0
+        self._window_chunk_files = []
+
+    def _build_chunk_file(self) -> str:
+        return os.path.join(
+            self._chunk_dir,
+            f"fft_chunk_w{int(self._window_idx):06d}_b{int(self._chunk_idx):06d}.npz",
+        )
+
+    def _window_progress_seconds(self) -> float:
+        fs = self._effective_fs()
+        if fs <= 0.0:
+            return 0.0
+        return float(self._window_samples) / fs
+
+    def _save_chunk(self, t: np.ndarray, y_map: Dict[str, np.ndarray]) -> None:
+        if not self._chunk_dir and not self._ensure_chunk_dir():
+            return
+        p = self._build_chunk_file()
+        out = {"t": np.asarray(t, dtype=np.float64), "phys": np.asarray(self._phys_order, dtype=object)}
+        for phys in self._phys_order:
+            y = y_map.get(phys)
+            if isinstance(y, np.ndarray) and y.size == t.size:
+                out[f"y_{phys}"] = np.asarray(y, dtype=np.float32)
+            else:
+                out[f"y_{phys}"] = np.full(int(t.size), np.nan, dtype=np.float32)
+        np.savez(p, **out)
+        self._window_chunk_files.append(p)
+        self._chunk_idx += 1
+
+    def _merge_window(self, fs: float) -> Tuple[Optional[np.ndarray], Optional[Dict[str, np.ndarray]], Optional[str]]:
+        if not self._window_chunk_files:
+            return None, None, None
+
+        y_blocks: Dict[str, List[np.ndarray]] = {phys: [] for phys in self._phys_order}
+        total = 0
+        for p in self._window_chunk_files:
+            if not os.path.isfile(p):
+                continue
+            try:
+                z = np.load(p, allow_pickle=False)
+            except Exception:
+                continue
+            try:
+                t = np.asarray(z["t"], dtype=np.float64)
+                n = int(t.size)
+                if n < 1:
+                    continue
+                total += n
+                for phys in self._phys_order:
+                    key = f"y_{phys}"
+                    if key in z:
+                        y = np.asarray(z[key], dtype=np.float32)
+                    else:
+                        y = np.full(n, np.nan, dtype=np.float32)
+                    if y.size < n:
+                        y = np.concatenate([y, np.full(n - y.size, np.nan, dtype=np.float32)])
+                    elif y.size > n:
+                        y = y[:n]
+                    y_blocks[phys].append(y)
+            finally:
+                try:
+                    z.close()
+                except Exception:
+                    pass
+
+        target_n = max(64, int(round(max(0.1, float(self._duration_s)) * fs)))
+        if total < 64:
+            return None, None, None
+
+        n_use = min(total, target_n)
+        t_all = np.arange(n_use, dtype=np.float64) / fs
+        y_all: Dict[str, np.ndarray] = {}
+        for phys in self._phys_order:
+            parts = y_blocks.get(phys, [])
+            if parts:
+                ycat = np.concatenate(parts).astype(np.float32, copy=False)
+                y_all[phys] = ycat[:n_use]
+            else:
+                y_all[phys] = np.full(n_use, np.nan, dtype=np.float32)
+
+        if not self._save_dir:
+            self._save_dir = DEFAULT_SAVE_DIR
+        os.makedirs(self._save_dir, exist_ok=True)
+        merged_name = f"BloccoDiCalcoloFFT{self._duration_label()}secondi.npz"
+        merged_path = os.path.join(self._save_dir, merged_name)
+        out = {"time": t_all, "phys": np.asarray(self._phys_order, dtype=object)}
+        for phys in self._phys_order:
+            out[f"y_{phys}"] = y_all[phys]
+        np.savez(merged_path, **out)
+        return t_all, y_all, merged_path
+
+    def _emit_fft(self, t_all: np.ndarray, y_all: Dict[str, np.ndarray], fs: float) -> None:
+        freq_ref = None
+        mag_map: Dict[str, np.ndarray] = {}
+        peaks = []
+        for phys in self._phys_order:
+            y = np.asarray(y_all.get(phys, []), dtype=np.float64)
+            if y.size != t_all.size or y.size < 64:
+                continue
+            if not np.all(np.isfinite(y)):
+                valid = np.isfinite(y)
+                if np.count_nonzero(valid) < 64:
+                    continue
+                y = np.interp(t_all, t_all[valid], y[valid])
+            freq, mag = self._compute_fft_mag(y, fs)
+            if not (isinstance(freq, np.ndarray) and isinstance(mag, np.ndarray)):
+                continue
+            if freq_ref is None:
+                freq_ref = freq
+            if freq_ref is None or mag.size != freq_ref.size:
+                continue
+            mag_map[phys] = mag
+            if mag.size > 1:
+                i = int(np.argmax(mag[1:])) + 1
+                peaks.append((phys, float(mag[i]), float(freq_ref[i])))
+        peak_text = "; ".join([f"{p}: {a:.3g} @ {f:.6g} Hz" for p, a, f in peaks])
+        if isinstance(freq_ref, np.ndarray) and mag_map:
+            self.sigResult.emit(freq_ref, mag_map, peak_text)
+
+    @QtCore.pyqtSlot(object)
+    def configure(self, cfg: object) -> None:
+        if not isinstance(cfg, dict):
+            return
+        try:
+            self._duration_s = max(0.1, float(cfg.get("duration_s", self._duration_s)))
+        except Exception:
+            pass
+        try:
+            self._save_dir = str(cfg.get("save_dir", self._save_dir) or self._save_dir)
+        except Exception:
+            pass
+        try:
+            po = cfg.get("phys_order", self._phys_order)
+            if isinstance(po, (list, tuple)):
+                self._phys_order = [str(x) for x in po]
+        except Exception:
+            pass
+        try:
+            self._cfg_fs_hz = max(0.0, float(cfg.get("fs_hz", self._cfg_fs_hz) or 0.0))
+        except Exception:
+            pass
+        try:
+            fs = self._cfg_fs_hz
+            ch = max(1, len(self._phys_order))
+            total = fs * self._duration_s * ch
+            if total >= 1_000_000:
+                self.sigGuardrail.emit(f"Guardrail FFT: finestra molto pesante ({total:.0f} punti totali).")
+        except Exception:
+            pass
+
+    @QtCore.pyqtSlot(bool, bool)
+    def reset(self, cleanup_files: bool, cleanup_temp_npz: bool) -> None:
+        self._reset_window_state()
+        if cleanup_files:
+            d = self._chunk_dir or self._get_chunk_dir()
+            if d and os.path.isdir(d):
+                try:
+                    for p in glob.glob(os.path.join(d, "fft_chunk_w*.npz")):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+                    if cleanup_temp_npz:
+                        try:
+                            shutil.rmtree(d, ignore_errors=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        if cleanup_files and cleanup_temp_npz:
+            self._chunk_dir = ""
+
+    @QtCore.pyqtSlot(object)
+    def process_block(self, payload: object) -> None:
+        try:
+            if not isinstance(payload, dict):
+                return
+            t = np.asarray(payload.get("t", []), dtype=np.float64)
+            if t.size < 1:
+                return
+            y_map = payload.get("y_map", {})
+            if not isinstance(y_map, dict):
+                return
+            if not self._phys_order and y_map:
+                self._phys_order = [str(k) for k in y_map.keys()]
+            if not self._phys_order:
+                self.sigGuardrail.emit("FFT worker: nessun canale attivo.")
+                return
+            if not self._ensure_chunk_dir():
+                return
+
+            fs_est = self._estimate_fs(t)
+            if fs_est > 0.0:
+                self._chunk_fs_est = fs_est
+            fs_eff = self._effective_fs()
+            if fs_eff <= 0.0:
+                self.sigGuardrail.emit("FFT worker: Fs non valido per la finestra FFT.")
+                return
+
+            self._save_chunk(t, y_map)
+            self._window_samples += int(t.size)
+
+            elapsed = self._window_progress_seconds()
+            target = max(0.1, float(self._duration_s))
+            fmax = fs_eff / 2.0
+            self.sigStatus.emit(f"FFT: finestra su disco {elapsed:.2f}/{target:g}s - F max= {fmax:.3g} Hz")
+            if elapsed < target:
+                return
+
+            t_all, y_all, merged_path = self._merge_window(fs_eff)
+            if isinstance(t_all, np.ndarray) and isinstance(y_all, dict):
+                self._emit_fft(t_all, y_all, fs_eff)
+                if merged_path:
+                    self.sigGuardrail.emit(f"FFT one-shot: file unito aggiornato -> {merged_path}")
+
+            self._cleanup_window_chunks()
+            self._window_idx += 1
+            self._reset_window_state()
+            self.sigStatus.emit(f"FFT: finestra su disco 0.00/{target:g}s - F max= {fmax:.3g} Hz")
+        except Exception as e:
+            self.sigGuardrail.emit(f"FFT worker error: {e}")

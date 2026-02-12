@@ -1,4 +1,4 @@
-﻿# Data/Ora: 2026-02-12 10:15:59
+﻿# Data/Ora: 2026-02-12 15:14:36
 # ui.py
 from PyQt5 import QtCore, QtWidgets, QtGui
 import sys
@@ -11,6 +11,8 @@ import os
 import xml.etree.ElementTree as ET
 import datetime
 import json
+import glob
+import importlib.util
 from typing import List, Callable, Optional, Dict, Any, Tuple
 
 # Path to store persistent configuration. It resides alongside this script.
@@ -30,16 +32,16 @@ COL_ENABLE   = 0
 COL_PHYS     = 1
 COL_TYPE     = 2   # Tipo risorsa (Voltage o sensori dal DB)
 COL_LABEL    = 3   # Nome canale (etichetta utente)
-COL_VALUE    = 4   # Valore istantaneo (con unitÃ  se selezionata)
+COL_VALUE    = 4   # Valore istantaneo (con unità se selezionata)
 COL_ZERO_BTN = 5
 COL_ZERO_VAL = 6
-# New columns for NIâ€‘9234 coupling and sensor limits.
+# New columns for NI‑9234 coupling and sensor limits.
 COL_COUPLING = 7
 COL_LIMIT_MAX = 8
 COL_LIMIT_MIN = 9
 
 # Percorso di default richiesto
-# Per la NIâ€‘9234 il progetto utilizza directory dedicate.  I percorsi
+# Per la NI‑9234 il progetto utilizza directory dedicate.  I percorsi
 # predefiniti possono essere personalizzati modificando queste costanti.
 DEFAULT_SAVE_DIR = r"C:\UG-WORK\SistemaAcquisizione_NI9234"
 SENSOR_DB_DEFAULT = r"C:\UG-WORK\SistemaAcquisizione_NI9234\Sensor database.xml"
@@ -58,20 +60,308 @@ XML_V2V = "Valore2Volt"
 XML_V2  = "Valore2"
 
 
+class FFTDiskWorker(QtCore.QObject):
+    sigStatus = QtCore.pyqtSignal(str)
+    sigResult = QtCore.pyqtSignal(object, object, object)   # (freq, mag_by_phys, peak_text)
+    sigGuardrail = QtCore.pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._duration_s = 5.0
+        self._save_dir = DEFAULT_SAVE_DIR
+        self._phys_order: List[str] = []
+        self._chunk_dir = ""
+        self._window_idx = 0
+        self._chunk_samples = 0
+        self._chunk_fs_est = 0.0
+        self._window_start_t = None
+        self._window_end_t = None
+        self._window_t_path = ""
+        self._window_y_paths: Dict[str, str] = {}
+        self._temp_npz_files: List[str] = []
+        self._temp_keep_count = 3
+
+    def _get_chunk_dir(self) -> str:
+        base = self._save_dir or DEFAULT_SAVE_DIR
+        return os.path.join(base, "_fft_chunks")
+
+    def _ensure_chunk_dir(self) -> bool:
+        d = self._get_chunk_dir()
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            return False
+        self._chunk_dir = d
+        return True
+
+    def _open_new_window_files(self) -> bool:
+        if not self._ensure_chunk_dir():
+            return False
+        win = int(self._window_idx)
+        self._window_t_path = os.path.join(self._chunk_dir, f"fft_window_{win:06d}_t.f64.bin")
+        self._window_y_paths = {
+            phys: os.path.join(self._chunk_dir, f"fft_window_{win:06d}_{phys}.f32.bin")
+            for phys in self._phys_order
+        }
+        return True
+
+    def _estimate_fs(self, t: np.ndarray) -> float:
+        if not isinstance(t, np.ndarray) or t.size < 2:
+            return 0.0
+        try:
+            dt = np.diff(t)
+            dt = dt[np.isfinite(dt) & (dt > 0.0)]
+            if dt.size < 1:
+                return 0.0
+            fs = 1.0 / float(np.median(dt))
+            return fs if np.isfinite(fs) and fs > 0.0 else 0.0
+        except Exception:
+            return 0.0
+
+    def _compute_fft_mag(self, x: np.ndarray, fs: float) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if not isinstance(x, np.ndarray):
+            return None, None
+        n = int(x.size)
+        if n < 64 or fs <= 0.0:
+            return None, None
+        nfft = 1 << int(np.floor(np.log2(max(64, n))))
+        if nfft < 64:
+            return None, None
+        seg = np.asarray(x[-nfft:], dtype=np.float64, copy=False)
+        seg = seg - float(np.mean(seg))
+        win = np.hanning(nfft).astype(np.float64, copy=False)
+        w_sum = float(np.sum(win))
+        if w_sum <= 0.0:
+            return None, None
+        spec = np.fft.rfft(seg * win)
+        mag = (2.0 / w_sum) * np.abs(spec)
+        freq = np.fft.rfftfreq(nfft, d=1.0 / fs)
+        return freq, mag
+
+    def _trim_temp_npz(self) -> None:
+        keep_n = max(1, int(self._temp_keep_count))
+        while len(self._temp_npz_files) > keep_n:
+            old = self._temp_npz_files.pop(0)
+            try:
+                if os.path.isfile(old):
+                    os.remove(old)
+            except Exception:
+                pass
+
+    @QtCore.pyqtSlot(object)
+    def configure(self, cfg: object) -> None:
+        if not isinstance(cfg, dict):
+            return
+        try:
+            self._duration_s = max(0.1, float(cfg.get("duration_s", self._duration_s)))
+        except Exception:
+            pass
+        try:
+            self._save_dir = str(cfg.get("save_dir", self._save_dir) or self._save_dir)
+        except Exception:
+            pass
+        try:
+            po = cfg.get("phys_order", self._phys_order)
+            if isinstance(po, (list, tuple)):
+                self._phys_order = [str(x) for x in po]
+        except Exception:
+            pass
+        try:
+            self._temp_keep_count = max(1, int(cfg.get("temp_keep_count", self._temp_keep_count)))
+        except Exception:
+            pass
+
+        # Guardrail warning only; no decimation.
+        try:
+            fs = float(cfg.get("fs_hz", 0.0) or 0.0)
+            ch = max(1, len(self._phys_order))
+            total = fs * self._duration_s * ch
+            if total >= 1_000_000:
+                self.sigGuardrail.emit(
+                    f"Guardrail FFT: finestra molto pesante ({total:.0f} punti totali)."
+                )
+        except Exception:
+            pass
+
+    @QtCore.pyqtSlot(bool, bool)
+    def reset(self, cleanup_files: bool, cleanup_temp_npz: bool) -> None:
+        if cleanup_files:
+            d = self._chunk_dir or self._get_chunk_dir()
+            if d and os.path.isdir(d):
+                try:
+                    for p in glob.glob(os.path.join(d, "fft_window_*")):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+                    if cleanup_temp_npz:
+                        for p in glob.glob(os.path.join(d, "fft_temp_window_*.npz")):
+                            try:
+                                os.remove(p)
+                            except Exception:
+                                pass
+                        try:
+                            shutil.rmtree(d, ignore_errors=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        self._chunk_samples = 0
+        self._chunk_fs_est = 0.0
+        self._window_start_t = None
+        self._window_end_t = None
+        self._window_t_path = ""
+        self._window_y_paths = {}
+        if cleanup_files and cleanup_temp_npz:
+            self._chunk_dir = ""
+            self._temp_npz_files = []
+
+    @QtCore.pyqtSlot(object)
+    def process_block(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        try:
+            t = np.asarray(payload.get("t", []), dtype=np.float64)
+        except Exception:
+            return
+        if t.size < 2:
+            return
+        y_map = payload.get("y_map", {})
+        if not isinstance(y_map, dict):
+            return
+        if not self._window_t_path:
+            if not self._open_new_window_files():
+                return
+
+        fs_est = self._estimate_fs(t)
+        if fs_est > 0.0:
+            self._chunk_fs_est = fs_est
+
+        try:
+            with open(self._window_t_path, "ab") as f:
+                t.tofile(f)
+        except Exception:
+            return
+
+        for phys in self._phys_order:
+            y = y_map.get(phys)
+            if isinstance(y, np.ndarray) and y.size == t.size:
+                y_arr = np.asarray(y, dtype=np.float32)
+            else:
+                y_arr = np.full(int(t.size), np.nan, dtype=np.float32)
+            p = self._window_y_paths.get(phys, "")
+            if not p:
+                continue
+            try:
+                with open(p, "ab") as f:
+                    y_arr.tofile(f)
+            except Exception:
+                pass
+
+        self._chunk_samples += int(t.size)
+        t0 = float(t[0]); t1 = float(t[-1])
+        if self._window_start_t is None:
+            self._window_start_t = t0
+        self._window_end_t = t1
+
+        if self._window_start_t is None or self._window_end_t is None:
+            return
+        elapsed = max(0.0, float(self._window_end_t) - float(self._window_start_t))
+        target = max(0.1, float(self._duration_s))
+        fmax = max(0.0, float(self._chunk_fs_est or 0.0) / 2.0)
+        self.sigStatus.emit(f"FFT: finestra su disco {elapsed:.2f}/{target:g}s - F max= {fmax:.3g} Hz")
+        if elapsed < target:
+            return
+
+        if not self._window_t_path or not os.path.isfile(self._window_t_path):
+            self.reset(True, False)
+            self._window_idx += 1
+            return
+        t_all = np.fromfile(self._window_t_path, dtype=np.float64)
+        if t_all.size < 64:
+            self.reset(True, False)
+            self._window_idx += 1
+            return
+
+        y_all = {}
+        n = int(t_all.size)
+        for phys in self._phys_order:
+            p = self._window_y_paths.get(phys, "")
+            if p and os.path.isfile(p):
+                y = np.fromfile(p, dtype=np.float32)
+                if y.size < n:
+                    y = np.concatenate([y, np.full(n - y.size, np.nan, dtype=np.float32)])
+                elif y.size > n:
+                    y = y[:n]
+            else:
+                y = np.full(n, np.nan, dtype=np.float32)
+            y_all[phys] = y
+
+        final_npz = os.path.join(self._chunk_dir, f"fft_temp_window_{int(self._window_idx):06d}.npz")
+        out = {"t": t_all, "phys": np.asarray(self._phys_order, dtype=object)}
+        for phys in self._phys_order:
+            out[f"y_{phys}"] = y_all[phys]
+        np.savez(final_npz, **out)
+        self._temp_npz_files.append(final_npz)
+        self._trim_temp_npz()
+
+        fs = self._estimate_fs(t_all)
+        if fs <= 0.0:
+            fs = float(self._chunk_fs_est or 0.0)
+        if fs <= 0.0:
+            self.reset(True, False)
+            self._window_idx += 1
+            return
+
+        freq_ref = None
+        mag_map: Dict[str, np.ndarray] = {}
+        peaks = []
+        for phys in self._phys_order:
+            y = np.asarray(y_all.get(phys, []), dtype=np.float64)
+            if y.size != t_all.size or y.size < 64:
+                continue
+            if not np.all(np.isfinite(y)):
+                v = np.isfinite(y)
+                if np.count_nonzero(v) < 64:
+                    continue
+                y = np.interp(t_all, t_all[v], y[v])
+            freq, mag = self._compute_fft_mag(y, fs)
+            if not (isinstance(freq, np.ndarray) and isinstance(mag, np.ndarray)):
+                continue
+            if freq_ref is None:
+                freq_ref = freq
+            if freq_ref is None or mag.size != freq_ref.size:
+                continue
+            mag_map[phys] = mag
+            if mag.size > 1:
+                i = int(np.argmax(mag[1:])) + 1
+                peaks.append((phys, float(mag[i]), float(freq_ref[i])))
+
+        peak_text = "; ".join([f"{p}: {a:.3g} @ {f:.6g} Hz" for p, a, f in peaks])
+        if isinstance(freq_ref, np.ndarray) and mag_map:
+            self.sigResult.emit(freq_ref, mag_map, peak_text)
+
+        self.reset(True, False)
+        self._window_idx += 1
+
+
 class AcquisitionWindow(QtWidgets.QMainWindow):
     # segnali thread-safe verso UI
     sigInstantBlock = QtCore.pyqtSignal(object, object, object)   # (t, [ys...], [names...])
     sigChartPoints  = QtCore.pyqtSignal(object, object, object)
     channelValueUpdated = QtCore.pyqtSignal(str, float)           # (start_label_name, value)
+    sigFftWorkerConfig = QtCore.pyqtSignal(object)
+    sigFftWorkerReset = QtCore.pyqtSignal(bool, bool)
+    sigFftWorkerBlock = QtCore.pyqtSignal(object)
 
     def __init__(self, acq_manager, merger, parent=None):
         super().__init__(parent)
         self.acq = acq_manager
         self.merger = merger
 
-        # Finestra per il modulo NIâ€‘9234.  In questo progetto non Ã¨ prevista
+        # Finestra per il modulo NI‑9234.  In questo progetto non è prevista
         # la selezione di altri modelli di scheda.
-        self.setWindowTitle("NIÂ 9234 Acquisition â€” Demo Architettura")
+        self.setWindowTitle("NI 9234 Acquisition — Demo Architettura")
         self.resize(1200, 740)
 
         # stati UI/logica
@@ -81,13 +371,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # mappature canali
         self._current_phys_order = []                    # ordine fisico corrente avviato
-        # La NIâ€‘9234 ha quattro canali simultanei
+        # La NI‑9234 ha quattro canali simultanei
         try:
             num_chans = int(getattr(self.acq, "num_channels", 4))
         except Exception:
             num_chans = 4
         # Inizializza le strutture mappatura e calibrazione per ciascun canale fisico
-        self._label_by_phys = {f"ai{i}": f"ai{i}" for i in range(num_chans)}   # label utente â€œNome canaleâ€
+        self._label_by_phys = {f"ai{i}": f"ai{i}" for i in range(num_chans)}   # label utente “Nome canale”
         self._sensor_type_by_phys = {f"ai{i}": "Voltage" for i in range(num_chans)}
         self._calib_by_phys = {f"ai{i}": {"unit":"", "a":1.0, "b":0.0} for i in range(num_chans)}
         self._start_label_by_phys = {}                   # mapping phys -> nome al momento dello start
@@ -107,14 +397,34 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # have its own curve in the FFT plot. These curves are created when
         # a new acquisition starts in _reset_plots_curves().
         self._fft_curves_by_phys = {}
-        self._fft_win_line_start = None
-        self._fft_win_line_end = None
 
         # --- FFT configuration ---
         # Duration of the time window (in seconds) used for FFT computation.
-        # This value can be modified by the user via a spin box.  A default
-        # of 5 seconds is chosen as a reasonable starting point.
+        # The FFT is computed from a dedicated low-rate buffer fed by the
+        # instant block stream, not from decimated chart points.
         self._fft_duration_seconds: float = 5.0
+        # Requested sampling rate for the FFT buffer. The effective target is
+        # adapted to duration and memory limits.
+        self._fft_target_fs_hz: float = 1000.0
+        # Hard cap on FFT buffered samples (all channels share the same time axis).
+        self._fft_max_samples: int = 200_000
+        # Recompute only when a full new FFT window is available.
+        self._fft_update_full_window: bool = True
+        self._last_fft_compute_ts: float = 0.0
+        self._fft_last_window_end_t: Optional[float] = None
+        self._fft_t = deque(maxlen=1)
+        self._fft_y_by_phys = {f"ai{i}": deque(maxlen=1) for i in range(num_chans)}
+        # Disk-backed FFT pipeline state.
+        self._fft_chunk_dir: str = ""
+        self._fft_chunk_samples: int = 0
+        self._fft_chunk_window_idx: int = 0
+        self._fft_chunk_fs_est: float = 0.0
+        self._fft_window_start_t: Optional[float] = None
+        self._fft_window_end_t: Optional[float] = None
+        self._fft_window_t_path: str = ""
+        self._fft_window_y_paths: Dict[str, str] = {}
+        self._fft_temp_npz_files: List[str] = []
+        self._fft_temp_keep_count: int = 3
         # Storage for the last computed FFT frequency vector and magnitude
         # spectra.  These arrays are used both for display and for saving
         # into the TDMS file at merge time.  They are updated in
@@ -128,10 +438,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._auto_fft_change: bool = False
 
         # Whether FFT computation is enabled.  When true, FFT is computed in
-        # sliding-window mode from the decimated chart data currently visible.
+        # sliding-window mode from the dedicated FFT buffer.
         self._fft_enabled: bool = False
+        self._reset_fft_buffers()
 
-        # Directory di salvataggio per la NIâ€‘9234 (nessun cambio dinamico per altri modelli)
+        # Directory di salvataggio per la NI‑9234 (nessun cambio dinamico per altri modelli)
         self._save_dir = DEFAULT_SAVE_DIR
         self._base_filename = "SenzaNome.tdms"
         self._active_subdir = None
@@ -152,11 +463,12 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # Track if we are in stall mode to avoid repeated adjustments
         self._stall_active = False
 
-        # Percorso del database sensori per la NIâ€‘9234
+        # Percorso del database sensori per la NI‑9234
         self._sensor_db_path = SENSOR_DB_DEFAULT
 
         # UI
         self._build_ui()
+        self._init_fft_worker()
         self._connect_signals()
 
         # Load persistent configuration (if available)
@@ -170,6 +482,29 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # Start backlog monitoring timer
         self._backlog_timer.start()
+
+    def _init_fft_worker(self):
+        self._fft_thread = QtCore.QThread(self)
+        worker_cls = FFTDiskWorker
+        try:
+            fft_path = os.path.join(os.path.dirname(__file__), "FFT calculation.py")
+            if os.path.isfile(fft_path):
+                spec = importlib.util.spec_from_file_location("fft_calculation_worker", fft_path)
+                if spec and spec.loader:
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    worker_cls = getattr(mod, "FFTDiskWorker", FFTDiskWorker)
+        except Exception:
+            worker_cls = FFTDiskWorker
+        self._fft_worker = worker_cls()
+        self._fft_worker.moveToThread(self._fft_thread)
+        self.sigFftWorkerConfig.connect(self._fft_worker.configure, QtCore.Qt.QueuedConnection)
+        self.sigFftWorkerReset.connect(self._fft_worker.reset, QtCore.Qt.QueuedConnection)
+        self.sigFftWorkerBlock.connect(self._fft_worker.process_block, QtCore.Qt.QueuedConnection)
+        self._fft_worker.sigStatus.connect(self._on_fft_worker_status)
+        self._fft_worker.sigResult.connect(self._on_fft_worker_result)
+        self._fft_worker.sigGuardrail.connect(self._on_fft_worker_guardrail)
+        self._fft_thread.start()
 
     # ----------------------------- Build UI -----------------------------
     def _build_ui(self):
@@ -263,7 +598,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # --------------------------------------------------------------
         # FFT tab: mostra il modulo della trasformata di Fourier calcolata
         # sulla finestra temporale del chart concatenato decimato.
-        # Ogni canale Ã¨ disegnato con colore e legenda dedicati.
+        # Ogni canale è disegnato con colore e legenda dedicati.
         self.tabFFT = QtWidgets.QWidget()
         vfft = QtWidgets.QVBoxLayout(self.tabFFT)
         # Plot widget for the FFT magnitude spectra.  The title will be
@@ -278,7 +613,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         vfft.addWidget(self.pgFFT, 1)
-        # Controls for FFT computation: duration and logâ€‘scale toggle
+        # Controls for FFT computation: duration and log‑scale toggle
         ctrl_layout = QtWidgets.QHBoxLayout()
         # Enable/disable continuous FFT update from the decimated chart tail.
         self.chkFftEnable = QtWidgets.QCheckBox("Abilita FFT")
@@ -300,7 +635,50 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.chkFftLogScale.toggled.connect(self._on_fft_log_scale_changed)
         ctrl_layout.addWidget(self.chkFftLogScale)
         ctrl_layout.addStretch(1)
+        self.lblFftStatus = QtWidgets.QLabel("")
+        try:
+            self.lblFftStatus.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            fnt_status = self.lblFftStatus.font()
+            fnt_status.setPointSize(max(fnt_status.pointSize() - 1, 8))
+            self.lblFftStatus.setFont(fnt_status)
+        except Exception:
+            pass
+        ctrl_layout.addWidget(self.lblFftStatus)
         vfft.addLayout(ctrl_layout)
+        # Manual axis limits for FFT plot.
+        axis_layout = QtWidgets.QHBoxLayout()
+        axis_layout.addWidget(QtWidgets.QLabel("X min:"))
+        self.spinFftXMin = QtWidgets.QDoubleSpinBox()
+        self.spinFftXMin.setRange(-1e9, 1e9)
+        self.spinFftXMin.setDecimals(6)
+        self.spinFftXMin.setValue(0.0)
+        axis_layout.addWidget(self.spinFftXMin)
+        axis_layout.addWidget(QtWidgets.QLabel("X max:"))
+        self.spinFftXMax = QtWidgets.QDoubleSpinBox()
+        self.spinFftXMax.setRange(-1e9, 1e9)
+        self.spinFftXMax.setDecimals(6)
+        self.spinFftXMax.setValue(50.0)
+        axis_layout.addWidget(self.spinFftXMax)
+        axis_layout.addWidget(QtWidgets.QLabel("Y min:"))
+        self.spinFftYMin = QtWidgets.QDoubleSpinBox()
+        self.spinFftYMin.setRange(-1e12, 1e12)
+        self.spinFftYMin.setDecimals(6)
+        self.spinFftYMin.setValue(0.0)
+        axis_layout.addWidget(self.spinFftYMin)
+        axis_layout.addWidget(QtWidgets.QLabel("Y max:"))
+        self.spinFftYMax = QtWidgets.QDoubleSpinBox()
+        self.spinFftYMax.setRange(-1e12, 1e12)
+        self.spinFftYMax.setDecimals(6)
+        self.spinFftYMax.setValue(10.0)
+        axis_layout.addWidget(self.spinFftYMax)
+        self.btnFftApplyAxes = QtWidgets.QPushButton("Applica assi FFT")
+        self.btnFftAutoAxes = QtWidgets.QPushButton("Auto assi FFT")
+        self.btnFftApplyAxes.clicked.connect(self._apply_fft_axis_limits)
+        self.btnFftAutoAxes.clicked.connect(self._auto_fft_axis_limits)
+        axis_layout.addWidget(self.btnFftApplyAxes)
+        axis_layout.addWidget(self.btnFftAutoAxes)
+        axis_layout.addStretch(1)
+        vfft.addLayout(axis_layout)
         # Label to display peak information for each channel.  It will show
         # the amplitude and frequency of the dominant component of the
         # spectrum.  Word wrap ensures long text wraps across lines.
@@ -317,7 +695,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # Barra salvataggio in basso
         bottom = QtWidgets.QHBoxLayout()
         self.txtSaveDir = QtWidgets.QLineEdit(self._save_dir)
-        self.btnBrowseDir = QtWidgets.QPushButton("Sfoglia cartellaâ€¦")
+        self.btnBrowseDir = QtWidgets.QPushButton("Sfoglia cartella…")
         self.txtBaseName = QtWidgets.QLineEdit(self._base_filename)
         # SpinBox per impostare la dimensione del buffer in RAM (MB) per il salvataggio
         self.spinRam = QtWidgets.QSpinBox()
@@ -331,8 +709,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.spinRam.setValue(500)
         self.spinRam.setSuffix(" MB")
         self.spinRam.setSingleStep(50)
-        self.btnStart = QtWidgets.QPushButton("Salva dati")            # passa a â€œSalvo in (xx s)â€¦â€
-        self.btnStop = QtWidgets.QPushButton("Stop e ricomponiâ€¦")
+        self.btnStart = QtWidgets.QPushButton("Salva dati")            # passa a “Salvo in (xx s)…”
+        self.btnStop = QtWidgets.QPushButton("Stop e ricomponi…")
         self.btnStop.setEnabled(False)
 
         bottom.addWidget(QtWidgets.QLabel("Percorso salvataggio:"))
@@ -350,10 +728,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         bottom.addWidget(self.btnStop)
         main.addLayout(bottom)
 
-        # Timer per l'aggiornamento dei grafici.  Un intervallo piÃ¹ lungo
+        # Timer per l'aggiornamento dei grafici.  Un intervallo più lungo
         # (100 ms invece dei 50 ms precedenti) riduce il numero di
         # conversioni da deque a array e di chiamate a setData, riducendo
-        # l'uso di memoria nel lungo periodo.  Questo valore puÃ² essere
+        # l'uso di memoria nel lungo periodo.  Questo valore può essere
         # ulteriormente modificato dinamicamente dalla routine di controllo
         # dello stall.
         self.guiTimer = QtCore.QTimer(self)
@@ -363,7 +741,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # Status bar + etichetta sempre visibile con rate
         self.statusBar = QtWidgets.QStatusBar()
         self.setStatusBar(self.statusBar)
-        self.lblRateInfo = QtWidgets.QLabel("â€”")
+        self.lblRateInfo = QtWidgets.QLabel("—")
         our_font = self.lblRateInfo.font()
         our_font.setPointSize(9)
         self.lblRateInfo.setFont(our_font)
@@ -444,17 +822,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 json.dump(cfg, f, indent=2)
         except Exception:
             pass
-
-    def closeEvent(self, event):
-        """
-        Reimplement the close event to persist settings before the
-        application terminates.
-        """
-        try:
-            self._save_config()
-        except Exception:
-            pass
-        super().closeEvent(event)
 
     # -------------------------- Backlog/Disk stall check --------------------------
     def _check_backlog(self):
@@ -551,7 +918,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def refresh_devices(self):
         """
         Popola la combo dispositivi includendo anche i moduli simulati.
-        Se sono presenti piÃ¹ NI-9201, apre un dialog per scegliere:
+        Se sono presenti più NI-9201, apre un dialog per scegliere:
         mostra 'nome modulo', 'chassis' e tag '[SIMULATED]'.
         """
         # usa i metadati completi dal core
@@ -560,7 +927,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             metas = self.acq.list_current_devices_meta()
         except AttributeError:
             # retrocompatibility: if the core doesn't provide list_current_devices_meta,
-            # fallback to NIâ€‘9201 discovery.
+            # fallback to NI‑9201 discovery.
             try:
                 names = self.acq.list_ni9201_devices()
             except Exception:
@@ -570,7 +937,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             metas = []
 
-        # Aggiorna combo: testo "cDAQ1Mod1 â€” NI 9201 â€” (cDAQ1) [SIMULATED]" ma userData=nome pulito
+        # Aggiorna combo: testo "cDAQ1Mod1 — NI 9201 — (cDAQ1) [SIMULATED]" ma userData=nome pulito
         self.cmbDevice.blockSignals(True)
         self.cmbDevice.clear()
         for m in metas:
@@ -578,18 +945,18 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             pt = m.get("product_type", "")
             ch = m.get("chassis", "")
             sim = " [SIMULATED]" if m.get("is_simulated") else ""
-            label = f"{name} â€” {pt} â€” ({ch}){sim}" if ch else f"{name} â€” {pt}{sim}"
+            label = f"{name} — {pt} — ({ch}){sim}" if ch else f"{name} — {pt}{sim}"
             self.cmbDevice.addItem(label, userData=name)
         self.cmbDevice.blockSignals(False)
 
         self._device_ready = bool(metas)
 
-        # scelta automatica / dialog se piÃ¹ device
-        # Messaggi specifici per la NIâ€‘9234
+        # scelta automatica / dialog se più device
+        # Messaggi specifici per la NI‑9234
         if not metas:
             QtWidgets.QMessageBox.information(
                 self, "Nessun dispositivo",
-                "Nessun NIâ€‘9234 trovato. Verifica in NIâ€‘MAX (anche simulati)."
+                "Nessun NI‑9234 trovato. Verifica in NI‑MAX (anche simulati)."
             )
         elif len(metas) == 1:
             self.cmbDevice.setCurrentIndex(0)
@@ -609,7 +976,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._populate_table()
         self._populate_type_column()
         self._recompute_all_calibrations()
-        self.lblRateInfo.setText("â€”")
+        self.lblRateInfo.setText("—")
 
     def _prompt_device_choice(self, metas):
         items = []
@@ -618,23 +985,23 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             pt = m.get("product_type", "")
             ch = m.get("chassis", "")
             sim = " [SIMULATED]" if m.get("is_simulated") else ""
-            label = f"{name} â€” {pt} â€” ({ch}){sim}" if ch else f"{name} â€” {pt}{sim}"
+            label = f"{name} — {pt} — ({ch}){sim}" if ch else f"{name} — {pt}{sim}"
             items.append(label)
-        # Messaggio specifico per la NIâ€‘9234
+        # Messaggio specifico per la NI‑9234
         item, ok = QtWidgets.QInputDialog.getItem(
             self, "Seleziona dispositivo",
-            "Sono presenti piÃ¹ moduli NIâ€‘9234.\nScegli quello da usare:",
+            "Sono presenti più moduli NI‑9234.\nScegli quello da usare:",
             items, 0, False
         )
         if not ok or not item:
             return None
-        # estrai il name prima della prima " â€” "
-        return item.split(" â€” ", 1)[0]
+        # estrai il name prima della prima " — "
+        return item.split(" — ", 1)[0]
 
     def _on_device_changed(self, _):
         self._stop_acquisition_ui_only()
         self._reset_plots()
-        self.lblRateInfo.setText("â€”")
+        self.lblRateInfo.setText("—")
 
     # ----------------------------- Sensor defs -----------------------------
     def _read_sensor_defs(self) -> dict:
@@ -764,7 +1131,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # Dopo aver ricalcolato le calibrazioni e aggiornato le legende,
         # aggiorna anche i suffissi dei limiti per tutte le righe.  Questo
-        # assicura che i campi Limite Max/Min visualizzino l'unitÃ  corretta.
+        # assicura che i campi Limite Max/Min visualizzino l'unità corretta.
         try:
             self._update_limit_units_all()
         except Exception:
@@ -792,8 +1159,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def _update_limit_units_for_row(self, row: int):
         """
         Aggiorna il suffisso dei campi "Limite Max input" e "Limite Min input"
-        per la riga specificata.  Utilizza l'unitÃ  ingegneristica associata al
-        sensore selezionato per quel canale.  Se non c'Ã¨ unitÃ  (ad esempio per
+        per la riga specificata.  Utilizza l'unità ingegneristica associata al
+        sensore selezionato per quel canale.  Se non c'è unità (ad esempio per
         "Voltage"), il suffisso viene rimosso.
         """
         # Recupera il nome fisico del canale
@@ -804,7 +1171,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             phys = ""
         if not phys:
             return
-        # Determina l'unitÃ  corrente
+        # Determina l'unità corrente
         unit = ""
         try:
             unit = self._calib_by_phys.get(phys, {}).get("unit", "")
@@ -828,8 +1195,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def _update_limit_units_all(self):
         """
         Aggiorna i suffissi dei campi Limite Max/Min per tutte le righe
-        della tabella in base alle unitÃ  ingegneristiche attualmente
-        selezionate.  Ãˆ utile chiamare questo metodo dopo che sono state
+        della tabella in base alle unità ingegneristiche attualmente
+        selezionate.  È utile chiamare questo metodo dopo che sono state
         ricalcolate le calibrazioni o dopo la costruzione della tabella.
         """
         for r in range(self.table.rowCount()):
@@ -843,10 +1210,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         """
         Popola la tabella dei canali in base al numero di canali disponibili
         per la scheda corrente. Ogni riga rappresenta un canale fisico e
-        contiene colonne per lâ€™abilitazione, la selezione del tipo di
+        contiene colonne per l’abilitazione, la selezione del tipo di
         risorsa (sensore), il nome del canale, il valore istantaneo, il
         reset dello zero, il valore azzerato, il coupling e i limiti
-        dellâ€™ingresso fisico.
+        dell’ingresso fisico.
         """
         self._building_table = True
         try:
@@ -879,7 +1246,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.table.setItem(i, COL_LABEL, labelItem)
 
             # Valore istantaneo (solo display)
-            valItem = QtWidgets.QTableWidgetItem("â€”")
+            valItem = QtWidgets.QTableWidgetItem("—")
             valItem.setFlags(valItem.flags() & ~QtCore.Qt.ItemIsUserCheckable & ~QtCore.Qt.ItemIsEditable)
             self.table.setItem(i, COL_VALUE, valItem)
 
@@ -930,8 +1297,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # Aggiorna i suffissi dei limiti per tutte le righe.  Quando la
         # tabella viene inizializzata i sensori sono impostati su "Voltage",
-        # quindi non hanno unitÃ , ma questa chiamata predispone i controlli
-        # affinchÃ© reagiscano correttamente quando il tipo di risorsa
+        # quindi non hanno unità, ma questa chiamata predispone i controlli
+        # affinché reagiscano correttamente quando il tipo di risorsa
         # cambia.
         try:
             self._update_limit_units_all()
@@ -953,14 +1320,14 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._calib_by_phys[phys] = calib
         self._rebuild_legends()
         self._push_sensor_map_to_core()
-        # Aggiorna la configurazione del canale poichÃ© la calibrazione potrebbe
+        # Aggiorna la configurazione del canale poiché la calibrazione potrebbe
         # influire sulla conversione dei limiti.
         try:
             self._on_config_changed_for_row(row)
         except Exception:
             pass
 
-        # Aggiorna i suffissi dei limiti per questa riga in base alla nuova unitÃ .
+        # Aggiorna i suffissi dei limiti per questa riga in base alla nuova unità.
         try:
             self._update_limit_units_for_row(row)
         except Exception:
@@ -1044,10 +1411,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             # Etichetta digitata dall'utente (fallback al nome fisico se vuota)
             new_label = (item.text() or "").strip() or phys
 
-            # Deduplica il nuovo nome rispetto agli altri canali.  Se esiste giÃ  un
+            # Deduplica il nuovo nome rispetto agli altri canali.  Se esiste già un
             # altro canale con la stessa etichetta (ignorando la differenza
             # maiuscole/minuscole), appende un suffisso _2, _3, ... fino a trovare
-            # un nome non in uso.  Questa logica evita ambiguitÃ  quando i nomi
+            # un nome non in uso.  Questa logica evita ambiguità quando i nomi
             # duplicati vengono usati per instradare i dati dal core alla UI.
             try:
                 base = new_label
@@ -1062,7 +1429,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                             txt = (it_lbl.text() or "").strip()
                             if txt:
                                 existing.append(txt.lower())
-                    # Se il nuovo nome Ã¨ giÃ  presente, trova un suffisso libero
+                    # Se il nuovo nome è già presente, trova un suffisso libero
                     if base.lower() in existing:
                         suffix = 2
                         candidate = f"{base}_{suffix}"
@@ -1089,15 +1456,15 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-            # Opzionale: aggiorna l'etichetta della frequenza se l'acquisizione Ã¨ attiva.
+            # Opzionale: aggiorna l'etichetta della frequenza se l'acquisizione è attiva.
             # Usiamo il flag interno _running invece dello stato del pulsante Stop,
-            # poichÃ© quest'ultimo viene abilitato solo durante il salvataggio.
+            # poiché quest'ultimo viene abilitato solo durante il salvataggio.
             try:
                 if getattr(self.acq, '_running', False):
                     self._update_rate_label(self._current_phys_order)
             except Exception:
                 pass
-            return  # <â€” importante: NON proseguire
+            return  # <— importante: NON proseguire
 
         # altri casi che possono richiedere riconfigurazione
         if col == COL_ENABLE:
@@ -1142,7 +1509,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         if not phys:
             self._stop_acquisition_ui_only()
-            self.lblRateInfo.setText("â€”")
+            self.lblRateInfo.setText("—")
             return
 
         # If the set of enabled channels has not changed and an acquisition is
@@ -1212,6 +1579,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         self._update_rate_label(phys)
         self._push_sensor_map_to_core()
+        if self._fft_enabled:
+            try:
+                self._emit_fft_worker_config()
+            except Exception:
+                pass
 
     def _update_rate_label(self, phys_list):
         try:
@@ -1223,10 +1595,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.lblRateInfo.setText(
                 f"Canali: {', '.join(labels)}  |  "
                 f"Rate per-canale {cur_per:.1f} kS/s  (agg: {cur_agg:.1f} kS/s)  |  "
-                f"Limiti modulo â†’ single {lim_single:.1f} kS/s, aggregato {lim_multi:.1f} kS/s"
+                f"Limiti modulo → single {lim_single:.1f} kS/s, aggregato {lim_multi:.1f} kS/s"
             )
         except Exception:
-            self.lblRateInfo.setText("â€”")
+            self.lblRateInfo.setText("—")
 
     def _on_rate_edit_finished(self):
         """
@@ -1310,6 +1682,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                             pass
             except Exception:
                 pass
+        if self._fft_enabled:
+            try:
+                self._emit_fft_worker_config()
+            except Exception:
+                pass
 
     def _stop_acquisition_ui_only(self):
         try:
@@ -1324,7 +1701,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.btnStop.setEnabled(False)
         if self.guiTimer.isActive():
             self.guiTimer.stop()
-        self.lblRateInfo.setText("â€”")
+        self.lblRateInfo.setText("—")
 
     # ----------------------------- TDMS: folder/name, start/stop, countdown -----------------------------
     def _choose_folder(self):
@@ -1367,7 +1744,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 self.acq.set_memory_limit_mb(mem_mb)
         except Exception:
             pass
-        # reset any residual inâ€‘memory blocks before changing the output directory
+        # reset any residual in‑memory blocks before changing the output directory
         try:
             if hasattr(self.acq, "clear_memory_buffer"):
                 self.acq.clear_memory_buffer()
@@ -1428,7 +1805,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.btnStart.setText("Salvataggio")
 
     def _update_start_button_text(self):
-        self.btnStart.setText(f"Salvo in ({self._countdown:02d} s) â€¦")
+        self.btnStart.setText(f"Salvo in ({self._countdown:02d} s) …")
 
     def _on_stop(self):
         # ferma core
@@ -1438,6 +1815,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             pass
         try:
             self.acq.stop()
+        except Exception:
+            pass
+        # cleanup temporary FFT chunk files written on disk (worker thread)
+        try:
+            self.sigFftWorkerReset.emit(True, True)
         except Exception:
             pass
 
@@ -1480,18 +1862,18 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
             # -----------------------------------------------------------
             # Prepara la struttura dati FFT per l'eventuale salvataggio.
-            # Se Ã¨ stata calcolata una FFT e l'utente ha richiesto la
+            # Se è stata calcolata una FFT e l'utente ha richiesto la
             # visualizzazione dello spettro, il dizionario ``fft_data`` viene
             # popolato con la frequenza e le magnitudini.  Questo dizionario
-            # sarÃ  quindi assegnato all'oggetto TdmsMerger, che provvederÃ  ad
+            # sarà quindi assegnato all'oggetto TdmsMerger, che provvederà ad
             # appendere un segmento FFT al file unito.  In assenza di dati
-            # validi, ``fft_data`` resterÃ  None e l'oggetto merger non
-            # aggiungerÃ  il segmento.
+            # validi, ``fft_data`` resterà None e l'oggetto merger non
+            # aggiungerà il segmento.
             try:
                 freq = getattr(self, '_last_fft_freq', None)
                 mags = getattr(self, '_last_fft_mag_by_phys', None)
                 if isinstance(freq, np.ndarray) and freq.size > 0 and isinstance(mags, dict) and mags:
-                    # Costruisci dizionario canali {nome -> array} e unitÃ 
+                    # Costruisci dizionario canali {nome -> array} e unità
                     ch_map = {}
                     units_map = {}
                     for phys, arr in mags.items():
@@ -1505,7 +1887,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                         # Prefix FFT_ per identificare i canali spettro
                         fft_label = f"FFT_{label}"
                         ch_map[fft_label] = arr.astype(np.float64)
-                        # Recupera l'unitÃ  ingegneristica associata a questo canale
+                        # Recupera l'unità ingegneristica associata a questo canale
                         unit = self._calib_by_phys.get(phys, {}).get("unit", "")
                         units_map[fft_label] = unit or ""
                     if ch_map:
@@ -1521,11 +1903,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 # procede con il merge dei soli dati temporali.
                 pass
             # Progress dialog
-            dlg = QtWidgets.QProgressDialog("Unione file TDMS in corsoâ€¦", "Annulla", 0, 1, self)
+            dlg = QtWidgets.QProgressDialog("Unione file TDMS in corso…", "Annulla", 0, 1, self)
             dlg.setWindowTitle("Unione in corso")
             dlg.setWindowModality(QtCore.Qt.WindowModal)
             dlg.setValue(0)
-            # memorizza la cartella temporanea perchÃ© _active_subdir verrÃ  azzerata
+            # memorizza la cartella temporanea perché _active_subdir verrà azzerata
             tmp_subdir = self._active_subdir
             # Define progress callback
             def _merge_progress(curr: int, total: int):
@@ -1560,11 +1942,367 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._uncheck_all_enabled()
 
     # ----------------------------- Grafici -----------------------------
+    def _get_fft_chunk_dir(self) -> str:
+        base_dir = self.txtSaveDir.text().strip() if hasattr(self, "txtSaveDir") else ""
+        if not base_dir:
+            base_dir = self._save_dir or DEFAULT_SAVE_DIR
+        return os.path.join(base_dir, "_fft_chunks")
+
+    def _reset_fft_disk_state(self, cleanup_files: bool, cleanup_temp_npz: bool = True) -> None:
+        if cleanup_files:
+            d = getattr(self, "_fft_chunk_dir", "") or self._get_fft_chunk_dir()
+            if d and os.path.isdir(d):
+                try:
+                    for p in glob.glob(os.path.join(d, "fft_window_*")):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+                    if cleanup_temp_npz:
+                        for p in glob.glob(os.path.join(d, "fft_temp_window_*.npz")):
+                            try:
+                                os.remove(p)
+                            except Exception:
+                                pass
+                        # Remove the temp directory itself on full cleanup.
+                        try:
+                            shutil.rmtree(d, ignore_errors=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        self._fft_chunk_samples = 0
+        self._fft_chunk_fs_est = 0.0
+        self._fft_window_start_t = None
+        self._fft_window_end_t = None
+        self._fft_window_t_path = ""
+        self._fft_window_y_paths = {}
+        if cleanup_files and cleanup_temp_npz:
+            self._fft_chunk_dir = ""
+        if cleanup_files and cleanup_temp_npz:
+            self._fft_temp_npz_files = []
+
+    def _trim_fft_temp_npz_files(self) -> None:
+        keep_n = max(1, int(getattr(self, "_fft_temp_keep_count", 3)))
+        files = [p for p in list(getattr(self, "_fft_temp_npz_files", [])) if isinstance(p, str) and p]
+        while len(files) > keep_n:
+            old = files.pop(0)
+            try:
+                if os.path.isfile(old):
+                    os.remove(old)
+            except Exception:
+                pass
+        self._fft_temp_npz_files = files
+
+    def _ensure_fft_chunk_dir(self) -> None:
+        d = self._get_fft_chunk_dir()
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            return
+        self._fft_chunk_dir = d
+
+    def _open_new_fft_window_files(self) -> bool:
+        self._ensure_fft_chunk_dir()
+        if not self._fft_chunk_dir:
+            return False
+        win = int(getattr(self, "_fft_chunk_window_idx", 0))
+        self._fft_window_t_path = os.path.join(self._fft_chunk_dir, f"fft_window_{win:06d}_t.f64.bin")
+        self._fft_window_y_paths = {
+            phys: os.path.join(self._fft_chunk_dir, f"fft_window_{win:06d}_{phys}.f32.bin")
+            for phys in self._current_phys_order
+        }
+        return True
+
+    def _append_fft_chunk_to_disk(self, t: np.ndarray, eng_by_phys: Dict[str, np.ndarray]) -> None:
+        if not self._fft_enabled:
+            return
+        if not isinstance(t, np.ndarray) or t.size < 2:
+            return
+        if not self._fft_window_t_path:
+            if not self._open_new_fft_window_files():
+                return
+
+        t_arr = np.asarray(t, dtype=np.float64)
+        if t_arr.size < 2:
+            return
+
+        fs_est = self._estimate_fs_from_time_vector(t_arr)
+        if fs_est <= 0.0:
+            try:
+                fs_est = float(getattr(self.acq, "current_rate_hz", 0.0) or 0.0)
+            except Exception:
+                fs_est = 0.0
+        if fs_est > 0.0:
+            self._fft_chunk_fs_est = fs_est
+
+        try:
+            with open(self._fft_window_t_path, "ab") as f:
+                t_arr.tofile(f)
+        except Exception:
+            return
+
+        for phys in self._current_phys_order:
+            y = eng_by_phys.get(phys)
+            if isinstance(y, np.ndarray) and y.size == t_arr.size:
+                y_arr = np.asarray(y, dtype=np.float32)
+            else:
+                y_arr = np.full(int(t_arr.size), np.nan, dtype=np.float32)
+            p = self._fft_window_y_paths.get(phys, "")
+            if not p:
+                continue
+            try:
+                with open(p, "ab") as f:
+                    y_arr.tofile(f)
+            except Exception:
+                pass
+
+        self._fft_chunk_samples += int(t_arr.size)
+        t0 = float(t_arr[0])
+        t1 = float(t_arr[-1])
+        if self._fft_window_start_t is None:
+            self._fft_window_start_t = t0
+        self._fft_window_end_t = t1
+
+    def _build_fft_window_npz_and_compute(self) -> None:
+        if self._fft_chunk_samples < 2:
+            return
+        t0 = self._fft_window_start_t
+        t1 = self._fft_window_end_t
+        if t0 is None or t1 is None:
+            return
+        elapsed = max(0.0, float(t1) - float(t0))
+        target = max(1.0, float(self._fft_duration_seconds))
+        fmax = max(0.0, float(self._fft_chunk_fs_est or 0.0) / 2.0)
+        try:
+            self.lblFftStatus.setText(f"FFT: finestra su disco {elapsed:.2f}/{target:g}s - F max= {fmax:.3g} Hz")
+        except Exception:
+            pass
+        if elapsed < target:
+            return
+
+        self._ensure_fft_chunk_dir()
+        if not self._fft_chunk_dir:
+            return
+        final_npz = os.path.join(
+            self._fft_chunk_dir,
+            f"fft_temp_window_{int(self._fft_chunk_window_idx):06d}.npz",
+        )
+
+        if not self._fft_window_t_path or not os.path.isfile(self._fft_window_t_path):
+            self._reset_fft_disk_state(cleanup_files=True, cleanup_temp_npz=False)
+            self._fft_chunk_window_idx += 1
+            return
+        t_all = np.fromfile(self._fft_window_t_path, dtype=np.float64)
+        if t_all.size < 64:
+            self._reset_fft_disk_state(cleanup_files=True, cleanup_temp_npz=False)
+            self._fft_chunk_window_idx += 1
+            return
+
+        y_all = {}
+        n = int(t_all.size)
+        for phys in self._current_phys_order:
+            p = self._fft_window_y_paths.get(phys, "")
+            if p and os.path.isfile(p):
+                y = np.fromfile(p, dtype=np.float32)
+                if y.size < n:
+                    pad = np.full(n - y.size, np.nan, dtype=np.float32)
+                    y = np.concatenate([y, pad])
+                elif y.size > n:
+                    y = y[:n]
+            else:
+                y = np.full(n, np.nan, dtype=np.float32)
+            y_all[phys] = y
+
+        out = {"t": t_all, "phys": np.asarray(self._current_phys_order, dtype=object)}
+        for phys in self._current_phys_order:
+            out[f"y_{phys}"] = y_all[phys]
+        np.savez(final_npz, **out)
+        self._fft_temp_npz_files.append(final_npz)
+        self._trim_fft_temp_npz_files()
+
+        self._compute_fft_from_npz(final_npz, fs_hint=float(self._fft_chunk_fs_est or 0.0))
+
+        self._reset_fft_disk_state(cleanup_files=True, cleanup_temp_npz=False)
+        self._fft_chunk_window_idx += 1
+
+    def _compute_fft_from_npz(self, npz_path: str, fs_hint: float = 0.0) -> None:
+        try:
+            with np.load(npz_path, allow_pickle=True) as z:
+                t_all = np.asarray(z["t"], dtype=np.float64)
+                if t_all.size < 64:
+                    return
+                fs = self._estimate_fs_from_time_vector(t_all)
+                if fs <= 0.0:
+                    fs = float(fs_hint or 0.0)
+                if fs <= 0.0:
+                    return
+
+                self._last_fft_freq = None
+                self._last_fft_mag_by_phys.clear()
+                peak_strings = []
+
+                for phys in self._current_phys_order:
+                    key = f"y_{phys}"
+                    if key not in z:
+                        continue
+                    y = np.asarray(z[key], dtype=np.float64)
+                    if y.size != t_all.size or y.size < 64:
+                        continue
+                    if not np.all(np.isfinite(y)):
+                        valid = np.isfinite(y)
+                        if np.count_nonzero(valid) < 64:
+                            continue
+                        y = np.interp(t_all, t_all[valid], y[valid])
+                    freq, mag = self._compute_welch_magnitude(y, fs)
+                    if not (isinstance(freq, np.ndarray) and isinstance(mag, np.ndarray)):
+                        continue
+                    if self._last_fft_freq is None:
+                        self._last_fft_freq = freq
+                    if self._last_fft_freq is None or mag.size != self._last_fft_freq.size:
+                        continue
+                    self._last_fft_mag_by_phys[phys] = mag
+                    curve = self._fft_curves_by_phys.get(phys)
+                    if curve is not None:
+                        try:
+                            curve.setData(self._last_fft_freq, mag)
+                        except Exception:
+                            pass
+                    if mag.size > 1:
+                        idx_peak = int(np.argmax(mag[1:])) + 1
+                        amp_peak = float(mag[idx_peak])
+                        f_peak = float(self._last_fft_freq[idx_peak])
+                        label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys))
+                        unit = self._calib_by_phys.get(phys, {}).get("unit", "")
+                        peak_strings.append(f"{label}: {amp_peak:.3g}{(' ' + unit) if unit else ''} @ {f_peak:.6g} Hz")
+
+                try:
+                    self.lblFftPeakInfo.setText("; ".join(peak_strings))
+                except Exception:
+                    pass
+        except Exception:
+            return
+
+    def _get_effective_fft_target_fs(self, fs_in: float = 0.0) -> float:
+        """
+        Return adaptive target Fs for FFT buffering.
+        Constrained by requested target, input Fs, duration and max samples.
+        """
+        try:
+            base_target = float(self._fft_target_fs_hz)
+        except Exception:
+            base_target = 1000.0
+        base_target = max(10.0, base_target)
+        try:
+            dur = float(self._fft_duration_seconds)
+        except Exception:
+            dur = 5.0
+        dur = max(1.0, dur)
+        try:
+            max_samp = int(self._fft_max_samples)
+        except Exception:
+            max_samp = 200_000
+        max_samp = max(2048, max_samp)
+        by_mem = max(10.0, float(max_samp) / dur)
+        tgt = min(base_target, by_mem)
+        if fs_in > 0.0:
+            tgt = min(tgt, fs_in)
+        return max(10.0, tgt)
+
+    def _reset_fft_buffers(self):
+        """
+        Recreate dedicated FFT ring buffers using current duration and channels.
+        Keeps memory bounded and independent from chart buffers.
+        """
+        try:
+            fs_in = float(getattr(self.acq, "current_rate_hz", 0.0) or 0.0)
+        except Exception:
+            fs_in = 0.0
+        target_fs = self._get_effective_fft_target_fs(fs_in=fs_in)
+        try:
+            req_s = float(self._fft_duration_seconds) * 1.15 + 1.0
+        except Exception:
+            req_s = 5.0
+        maxlen = max(256, int(round(req_s * target_fs)))
+        try:
+            maxlen = min(maxlen, int(self._fft_max_samples))
+        except Exception:
+            pass
+
+        try:
+            old_t = list(self._fft_t)
+        except Exception:
+            old_t = []
+        self._fft_t = deque(old_t[-maxlen:], maxlen=maxlen)
+
+        old_map = dict(getattr(self, "_fft_y_by_phys", {}) or {})
+        active_phys = list(self._current_phys_order) if self._current_phys_order else list(old_map.keys())
+        if not active_phys:
+            try:
+                n = int(getattr(self.acq, "num_channels", 4) or 4)
+            except Exception:
+                n = 4
+            active_phys = [f"ai{i}" for i in range(max(1, n))]
+
+        new_map = {}
+        for phys in active_phys:
+            old_dq = old_map.get(phys, [])
+            new_map[phys] = deque(list(old_dq)[-maxlen:], maxlen=maxlen)
+        self._fft_y_by_phys = new_map
+
+    def _estimate_fs_from_time_vector(self, t: np.ndarray) -> float:
+        """Estimate sampling frequency from a monotonic time vector."""
+        if not isinstance(t, np.ndarray) or t.size < 2:
+            return 0.0
+        try:
+            dt = np.diff(t)
+            dt = dt[np.isfinite(dt) & (dt > 0.0)]
+            if dt.size < 1:
+                return 0.0
+            fs = 1.0 / float(np.median(dt))
+            return fs if np.isfinite(fs) and fs > 0.0 else 0.0
+        except Exception:
+            return 0.0
+
+    def _compute_welch_magnitude(self, x: np.ndarray, fs: float) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Magnitude spectrum from a long FFT window.
+        Uses a power-of-two tail to keep computation efficient while preserving
+        low-frequency resolution for long acquisitions.
+        """
+        if not isinstance(x, np.ndarray):
+            return None, None
+        n = int(x.size)
+        if n < 64 or fs <= 0.0:
+            return None, None
+
+        try:
+            nfft_cap = int(self._fft_max_samples)
+        except Exception:
+            nfft_cap = 200_000
+        n_use = min(n, max(64, nfft_cap))
+        nfft = 1 << int(np.floor(np.log2(max(64, n_use))))
+        if nfft < 64:
+            return None, None
+
+        seg = np.asarray(x[-nfft:], dtype=np.float64, copy=False)
+        seg = seg - float(np.mean(seg))
+        win = np.hanning(nfft).astype(np.float64, copy=False)
+        w_sum = float(np.sum(win))
+        if w_sum <= 0.0:
+            return None, None
+        spec = np.fft.rfft(seg * win)
+        mag = (2.0 / w_sum) * np.abs(spec)
+        freq = np.fft.rfftfreq(nfft, d=1.0 / fs)
+        return freq, mag
+
     def _reset_plots(self):
         self._chart_x.clear()
         for dq in self._chart_y_by_phys.values(): dq.clear()
         self._instant_t = np.array([], dtype=float)
         self._instant_y_by_phys = {k: np.array([], dtype=float) for k in self._instant_y_by_phys}
+        self._reset_fft_buffers()
+        self._last_fft_compute_ts = 0.0
 
         for c in list(self._chart_curves_by_phys.values()):
             try: self.pgChart.removeItem(c)
@@ -1590,15 +2328,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 self._fft_legend.clear()
         except Exception:
             pass
-        # Remove FFT window markers when plot items are reset.
-        for ln_name in ('_fft_win_line_start', '_fft_win_line_end'):
-            ln = getattr(self, ln_name, None)
-            if ln is not None:
-                try:
-                    self.pgChart.removeItem(ln)
-                except Exception:
-                    pass
-                setattr(self, ln_name, None)
         self._chart_legend.clear()
         self._instant_legend.clear()
 
@@ -1642,8 +2371,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self._instant_legend.addItem(ic, label)
 
             # FFT plot: crea una curva per questo canale e aggiungila alla
-            # legenda FFT.  Non si applica decimazione o clipping qui perchÃ©
-            # l'FFT Ã¨ giÃ  un riassunto della finestra selezionata.
+            # legenda FFT.  Non si applica decimazione o clipping qui perché
+            # l'FFT è già un riassunto della finestra selezionata.
             try:
                 cfft = self.pgFFT.plot(name=label, pen=pg.mkPen(color=color, width=1.5))
             except Exception:
@@ -1651,7 +2380,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             if cfft is not None:
                 try:
                     # Lascio ClipToView disabilitato per l'FFT; eventuale
-                    # riduzione di punti sarÃ  gestita dal calcolo stesso.
+                    # riduzione di punti sarà gestita dal calcolo stesso.
                     pass
                 except Exception:
                     pass
@@ -1669,7 +2398,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.pgFFT.setTitle(title)
         except Exception:
             pass
-        self._update_fft_window_lines()
 
     def _rebuild_legends(self):
         self._chart_legend.clear()
@@ -1713,7 +2441,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         for phys, curve in self._chart_curves_by_phys.items():
             self._chart_y_by_phys[phys].clear()
             curve.clear()
-        self._update_fft_window_lines()
 
     # slot dai segnali (main thread)
     def _slot_instant_block(self, t: np.ndarray, ys: list, names: list):
@@ -1721,6 +2448,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self._instant_t = np.asarray(t, dtype=float)
             # mappa nome di start -> phys
             start_to_phys = {name: phys for phys, name in self._start_label_by_phys.items()}
+            eng_by_phys = {}
             for name, y in zip(names, ys):
                 phys = start_to_phys.get(name)
                 if not phys: continue
@@ -1728,8 +2456,16 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 a = float(cal.get("a",1.0)); b = float(cal.get("b",0.0))
                 y_eng = a * np.asarray(y, dtype=float) + b
                 self._instant_y_by_phys[phys] = y_eng
+                eng_by_phys[phys] = y_eng
+            if self._fft_enabled:
+                payload = {"t": np.asarray(self._instant_t, dtype=np.float64), "y_map": eng_by_phys}
+                self.sigFftWorkerBlock.emit(payload)
 
-        except RuntimeError:
+        except Exception:
+            try:
+                self.lblFftStatus.setText("FFT: errore invio blocco al worker")
+            except Exception:
+                pass
             pass
 
     def _slot_chart_points(self, t_pts: np.ndarray, ys_pts: list, names: list):
@@ -1787,174 +2523,125 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # Keep FFT window markers aligned to the decimated chart tail.
-        self._update_fft_window_lines()
+        # FFT computation is disk-driven in _slot_instant_block.
 
-        if self._fft_enabled:
-            self._compute_fft_from_chart_window()
+    def _set_fft_window_lines_visible(self, visible: bool) -> None:
+        # Window markers over decimated chart intentionally disabled.
+        return
 
-    def _get_chart_sampling_rate(self) -> float:
-        """
-        Effective sampling rate of the decimated chart.
-        Fs_chart = Fs_raw / dec_step where dec_step is acquisition decimation.
-        """
+    def _update_fft_window_lines(self) -> None:
+        # Window markers over decimated chart intentionally disabled.
+        return
+
+    def _apply_fft_axis_limits(self) -> None:
         try:
-            fs_raw = float(getattr(self.acq, 'current_rate_hz', 0.0) or 0.0)
+            xmin = float(self.spinFftXMin.value())
+            xmax = float(self.spinFftXMax.value())
+            ymin = float(self.spinFftYMin.value())
+            ymax = float(self.spinFftYMax.value())
         except Exception:
-            fs_raw = 0.0
+            return
+
+        if not (xmax > xmin and ymax > ymin):
+            QtWidgets.QMessageBox.warning(self, "Assi FFT", "Intervalli non validi: serve max > min.")
+            return
+        if self.chkFftLogScale.isChecked() and (xmin <= 0.0 or xmax <= 0.0 or ymin <= 0.0 or ymax <= 0.0):
+            QtWidgets.QMessageBox.warning(self, "Assi FFT", "In scala log-log gli estremi devono essere > 0.")
+            return
         try:
-            dec_step = int(getattr(self.acq, 'chart_decimation', getattr(self.acq, '_chart_decim', 1)) or 1)
+            if self.chkFftLogScale.isChecked():
+                # In pyqtgraph log-mode the view range is in log10 coordinates.
+                self.pgFFT.setXRange(np.log10(xmin), np.log10(xmax), padding=0.0)
+                self.pgFFT.setYRange(np.log10(ymin), np.log10(ymax), padding=0.0)
+            else:
+                self.pgFFT.setXRange(xmin, xmax, padding=0.0)
+                self.pgFFT.setYRange(ymin, ymax, padding=0.0)
         except Exception:
-            dec_step = 1
-        dec_step = max(1, dec_step)
-        if fs_raw <= 0.0:
-            return 0.0
-        return fs_raw / float(dec_step)
+            pass
 
-    def _compute_fft_from_chart_window(self) -> None:
-        """
-        Compute FFT from the same decimated chart window delimited by START/END
-        markers. Chosen behavior: sliding window update while checkbox is active,
-        so FFT always represents the most recent visible chart segment.
-        """
-        fs_chart = self._get_chart_sampling_rate()
-        if fs_chart <= 0.0:
-            return
-
-        n_chart = len(self._chart_x)
-        if n_chart < 2:
-            return
-
+    def _auto_fft_axis_limits(self) -> None:
         try:
-            required_samples = int(round(float(self._fft_duration_seconds) * fs_chart))
+            self.pgFFT.enableAutoRange(axis='xy', enable=True)
+            self.pgFFT.getPlotItem().autoRange()
         except Exception:
-            required_samples = 0
-        required_samples = max(2, required_samples)
+            pass
 
-        # Use available samples up to required_samples from the chart tail.
-        window_len = min(required_samples, n_chart)
-        if window_len < 2:
-            return
+    @QtCore.pyqtSlot(str)
+    def _on_fft_worker_status(self, text: str) -> None:
+        try:
+            self.lblFftStatus.setText(str(text or ""))
+        except Exception:
+            pass
 
-        # All chart channels should align with chart_x; use shortest tail as guard.
-        lengths = [len(self._chart_y_by_phys.get(phys, ())) for phys in self._current_phys_order]
-        if not lengths:
+    @QtCore.pyqtSlot(object, object, object)
+    def _on_fft_worker_result(self, freq: object, mag_map: object, _peak_text: object) -> None:
+        if not isinstance(freq, np.ndarray):
             return
-        min_len = min(lengths + [n_chart])
-        if min_len < 2:
+        if not isinstance(mag_map, dict):
             return
-        window_len = min(window_len, min_len)
-        if window_len < 2:
-            return
-
-        self._last_fft_freq = np.fft.rfftfreq(window_len, d=1.0 / fs_chart)
+        self._last_fft_freq = np.asarray(freq, dtype=np.float64)
         self._last_fft_mag_by_phys.clear()
         peak_strings = []
-
-        for phys in self._current_phys_order:
-            dq = self._chart_y_by_phys.get(phys)
-            if not dq or len(dq) < window_len:
-                continue
+        for phys, mag in mag_map.items():
             try:
-                arr = np.fromiter(list(dq)[-window_len:], dtype=float, count=window_len)
+                arr = np.asarray(mag, dtype=np.float64)
             except Exception:
                 continue
-            if arr.size < 2:
+            if arr.size != self._last_fft_freq.size:
                 continue
-
-            # Hann window reduces spectral leakage and keeps FFT consistent.
-            try:
-                arr = arr * np.hanning(arr.size)
-            except Exception:
-                pass
-
-            try:
-                mag = np.abs(np.fft.rfft(arr))
-            except Exception:
-                continue
-
-            self._last_fft_mag_by_phys[phys] = mag
+            self._last_fft_mag_by_phys[phys] = arr
             curve = self._fft_curves_by_phys.get(phys)
-            if curve is not None and mag.size == self._last_fft_freq.size:
+            if curve is not None:
                 try:
-                    curve.setData(self._last_fft_freq, mag)
+                    curve.setData(self._last_fft_freq, arr)
                 except Exception:
                     pass
-
-            if mag.size > 1:
-                idx_peak = int(np.argmax(mag[1:])) + 1
-                amp_peak = float(mag[idx_peak])
+            if arr.size > 1:
+                idx_peak = int(np.argmax(arr[1:])) + 1
+                amp_peak = float(arr[idx_peak])
                 f_peak = float(self._last_fft_freq[idx_peak])
                 label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys))
                 unit = self._calib_by_phys.get(phys, {}).get('unit', '')
-                peak_strings.append(f"{label}: {amp_peak:.3g}{(' ' + unit) if unit else ''} @ {f_peak:.3g} Hz")
-
-        # Clear channels that were not computed in this cycle.
+                peak_strings.append(f"{label}: {amp_peak:.3g}{(' ' + unit) if unit else ''} @ {f_peak:.6g} Hz")
         for phys, curve in self._fft_curves_by_phys.items():
             if phys not in self._last_fft_mag_by_phys:
                 try:
                     curve.clear()
                 except Exception:
                     pass
-
         try:
             self.lblFftPeakInfo.setText("; ".join(peak_strings))
         except Exception:
             pass
 
-    def _set_fft_window_lines_visible(self, visible: bool) -> None:
+    @QtCore.pyqtSlot(str)
+    def _on_fft_worker_guardrail(self, msg: str) -> None:
         try:
-            if self._fft_win_line_start is not None:
-                self._fft_win_line_start.setVisible(visible)
-            if self._fft_win_line_end is not None:
-                self._fft_win_line_end.setVisible(visible)
+            self.statusBar.showMessage(str(msg), 6000)
+        except Exception:
+            pass
+        try:
+            self.lblFftStatus.setText(str(msg))
         except Exception:
             pass
 
-    def _update_fft_window_lines(self) -> None:
-        """
-        Update START/END markers over the decimated chart.
-        END is the latest chart sample time; START = END - FFT_duration.
-        """
-        if self._fft_win_line_start is None or self._fft_win_line_end is None:
-            try:
-                pen = pg.mkPen(color=(255, 255, 0), width=1.6, style=QtCore.Qt.DashLine)
-                self._fft_win_line_start = pg.InfiniteLine(angle=90, movable=False, pen=pen)
-                self._fft_win_line_end = pg.InfiniteLine(angle=90, movable=False, pen=pen)
-                self.pgChart.addItem(self._fft_win_line_start)
-                self.pgChart.addItem(self._fft_win_line_end)
-            except Exception:
-                self._fft_win_line_start = None
-                self._fft_win_line_end = None
-                return
-
-        if not self._fft_enabled:
-            self._set_fft_window_lines_visible(False)
-            return
-
-        n_chart = len(self._chart_x)
-        if n_chart < 1:
-            self._set_fft_window_lines_visible(False)
-            return
-
+    def _emit_fft_worker_config(self) -> None:
         try:
-            x_end = float(self._chart_x[-1])
+            fs = float(getattr(self.acq, "current_rate_hz", 0.0) or 0.0)
         except Exception:
-            self._set_fft_window_lines_visible(False)
-            return
-        x_start = x_end - float(self._fft_duration_seconds)
-
-        try:
-            self._fft_win_line_end.setPos(x_end)
-            self._fft_win_line_start.setPos(x_start)
-            self._set_fft_window_lines_visible(True)
-        except Exception:
-            pass
+            fs = 0.0
+        cfg = {
+            "duration_s": float(self._fft_duration_seconds),
+            "save_dir": self.txtSaveDir.text().strip() or self._save_dir or DEFAULT_SAVE_DIR,
+            "phys_order": list(self._current_phys_order),
+            "temp_keep_count": int(getattr(self, "_fft_temp_keep_count", 3)),
+            "fs_hz": fs,
+        }
+        self.sigFftWorkerConfig.emit(cfg)
 
     def _on_fft_duration_changed(self, value: float) -> None:
         """
-        Slot called when the user changes FFT duration. It updates markers and,
-        if FFT is enabled, recomputes immediately from the chart decimated tail.
+        Slot called when the user changes FFT duration.
         """
         try:
             self._fft_duration_seconds = float(value)
@@ -1965,19 +2652,28 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.pgFFT.setTitle(title)
         except Exception:
             pass
-        self._update_fft_window_lines()
+        self._reset_fft_buffers()
+        self.sigFftWorkerReset.emit(True, True)
+        self._fft_chunk_window_idx = 0
+        self._last_fft_compute_ts = 0.0
+        self._fft_last_window_end_t = None
+        self._emit_fft_worker_config()
         if self._fft_enabled:
-            self._compute_fft_from_chart_window()
+            try:
+                tgt = max(1.0, float(self._fft_duration_seconds))
+                self.lblFftStatus.setText(f"FFT: finestra su disco 0.00/{tgt:g}s - F max= 0 Hz")
+            except Exception:
+                pass
 
     def _on_fft_log_scale_changed(self, checked: bool) -> None:
         """
-        Slot called when the user toggles the logâ€‘scale checkbox.  Sets the
-        FFT plot axes to logâ€‘log mode if checked, otherwise linear.
+        Slot called when the user toggles the log‑scale checkbox.  Sets the
+        FFT plot axes to log‑log mode if checked, otherwise linear.
         """
         try:
             # PyQtGraph allows separate log settings for x and y axes.  Set
-            # both to the same state to achieve a logâ€‘log or linearâ€‘linear
-            # display.  When switching back to linear, any nonâ€‘positive
+            # both to the same state to achieve a log‑log or linear‑linear
+            # display.  When switching back to linear, any non‑positive
             # samples will be handled gracefully by pyqtgraph.
             self.pgFFT.setLogMode(checked, checked)
         except Exception:
@@ -1985,19 +2681,19 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     def _on_fft_enable_toggled(self, checked: bool) -> None:
         """
-        Enable/disable FFT over decimated chart data.
-
-        Semantics choice: sliding-window mode (preferred). As soon as FFT is
-        enabled, if enough chart history already exists, spectrum is computed
-        immediately; then it keeps updating while new chart points arrive.
+        Enable/disable FFT over the dedicated FFT buffer.
         """
         if getattr(self, '_auto_fft_change', False):
             return
         self._fft_enabled = bool(checked)
-        self._update_fft_window_lines()
         if self._fft_enabled:
             # Clear previous spectra so the next display corresponds only to
-            # the current chart-driven window selection.
+            # the current FFT-buffer selection.
+            self._reset_fft_buffers()
+            self.sigFftWorkerReset.emit(True, True)
+            self._fft_chunk_window_idx = 0
+            self._last_fft_compute_ts = 0.0
+            self._fft_last_window_end_t = None
             self._last_fft_freq = None
             self._last_fft_mag_by_phys.clear()
             for curve in self._fft_curves_by_phys.values():
@@ -2006,10 +2702,17 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
             try:
-                self.lblFftPeakInfo.setText("")
+                tgt = max(1.0, float(self._fft_duration_seconds))
+                self.lblFftStatus.setText(f"FFT: finestra su disco 0.00/{tgt:g}s - F max= 0 Hz")
             except Exception:
                 pass
-            self._compute_fft_from_chart_window()
+            self._emit_fft_worker_config()
+        else:
+            self.sigFftWorkerReset.emit(True, True)
+            try:
+                self.lblFftStatus.setText("")
+            except Exception:
+                pass
 
     # ----------------------------- Definisci Tipo Risorsa -----------------------------
     def _open_resource_manager(self):
@@ -2076,7 +2779,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             gen['ram_mb'] = str(int(self.spinRam.value()))
         except Exception:
             gen['ram_mb'] = ""
-        # Frequenza di campionamento (puÃ² essere stringa vuota o "Max")
+        # Frequenza di campionamento (può essere stringa vuota o "Max")
         txt = (self.rateEdit.text() or "").strip()
         gen['fs'] = txt
         # Nome del device corrente
@@ -2161,7 +2864,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         """
         Carica una configurazione da un file INI e applica tutte le impostazioni:
         cartella di salvataggio, base filename, buffer RAM, frequenza, lista canali e database sensori.
-        Prima del caricamento viene verificata la compatibilitÃ  tra il modello
+        Prima del caricamento viene verificata la compatibilità tra il modello
         di scheda salvato nel workspace (campo ``supporteddaq``) e la scheda
         attualmente selezionata; se non coincidono viene mostrato un errore.
         """
@@ -2192,7 +2895,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             supported_list = [s.strip().upper() for s in supported.split(',') if s.strip()]
             if bt.upper() not in supported_list:
                 QtWidgets.QMessageBox.critical(self, "Errore",
-                    f"Il workspace non Ã¨ compatibile con {bt}.")
+                    f"Il workspace non è compatibile con {bt}.")
                 return
         # Aggiorna percorso DB sensori
         sensor_db = gen.get('sensor_db_path', '').strip()
@@ -2338,7 +3041,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                     if zero_disp:
                         self.table.item(r, COL_ZERO_VAL).setText(zero_disp)
                     else:
-                        # se non c'Ã¨ display, mostra 0.0 per coerenza
+                        # se non c'è display, mostra 0.0 per coerenza
                         try:
                             self.table.item(r, COL_ZERO_VAL).setText('0.0')
                         except Exception:
@@ -2349,12 +3052,12 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     # ----------------------------- Channel helpers per ResourceManager -----------------------------
     def is_channel_enabled(self, phys: str) -> bool:
-        """Restituisce True se il canale fisico Ã¨ abilitato nella tabella."""
+        """Restituisce True se il canale fisico è abilitato nella tabella."""
         try:
             for r in range(self.table.rowCount()):
                 phys_item = self.table.item(r, COL_PHYS)
                 if phys_item and phys_item.text() == phys:
-                    # colonna abilita Ã¨ una QTableWidgetItem con stato di check
+                    # colonna abilita è una QTableWidgetItem con stato di check
                     enable_item = self.table.item(r, COL_ENABLE)
                     if enable_item:
                         return enable_item.checkState() == QtCore.Qt.Checked
@@ -2399,6 +3102,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     # ----------------------------- Chiusura ordinata -----------------------------
     def closeEvent(self, event: QtGui.QCloseEvent):
+        try:
+            self._save_config()
+        except Exception:
+            pass
         # stop timer UI
         try:
             if self.guiTimer.isActive():
@@ -2412,6 +3119,16 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             pass
         try:
             self.acq.stop()
+        except Exception:
+            pass
+        try:
+            self.sigFftWorkerReset.emit(True, True)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_fft_thread") and self._fft_thread is not None:
+                self._fft_thread.quit()
+                self._fft_thread.wait(2000)
         except Exception:
             pass
         # disconnetti segnali
@@ -2432,7 +3149,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def _on_zero_button_clicked(self, phys: str):
         """
         Azzeramento canale:
-        - Legge il valore istantaneo ATTUALE (in unitÃ  ingegneristiche)
+        - Legge il valore istantaneo ATTUALE (in unità ingegneristiche)
         - Lo mostra in colonna 'Valore azzerato'
         - Fissa lo zero nel core come valore RAW (Volt) dell'istante
         """
@@ -2441,13 +3158,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         if r < 0:
             return
 
-        # 1) valore istantaneo in unitÃ  ingegneristiche (quello che vedi in UI)
+        # 1) valore istantaneo in unità ingegneristiche (quello che vedi in UI)
         try:
             val_eng = self.acq.get_last_engineered(phys)
         except Exception:
             val_eng = None
 
-        # unitÃ  per visualizzazione
+        # unità per visualizzazione
         unit = self._calib_by_phys.get(phys, {}).get("unit", "")
         if val_eng is not None:
             txt = f"{val_eng:.6g}" + (f" {unit}" if unit else "")
@@ -2484,7 +3201,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             it = self.table.item(r, COL_ENABLE)
             if it:
                 if lock:
-                    # rimuovo la possibilitÃ  di spuntare
+                    # rimuovo la possibilità di spuntare
                     it.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
                 else:
                     # riabilito la spunta
@@ -2526,6 +3243,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                     it.setCheckState(QtCore.Qt.Unchecked)
         finally:
             self._auto_change = False
-        # applica lo stato allâ€™acquisizione
+        # applica lo stato all’acquisizione
         self._update_acquisition_from_table()
+
 
