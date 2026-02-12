@@ -1,3 +1,4 @@
+﻿# Data/Ora: 2026-02-12 10:15:59
 import os
 import datetime
 import numpy as np
@@ -34,18 +35,18 @@ class TdmsMerger:
       - t0_first e fs sono ricavati dal primo segmento che li dichiara (via wf_*)
       - Se fs manca ovunque, fallback a 1.0 Hz (evita crash)
     
-    Oltre a fondere i dati temporali, questo oggetto può opzionalmente
-    apporre uno spettro FFT al file TDMS finale.  La proprietà
-    ``fft_data`` può essere impostata prima di chiamare ``merge_temp_tdms``
+    Oltre a fondere i dati temporali, questo oggetto puÃ² opzionalmente
+    apporre uno spettro FFT al file TDMS finale.  La proprietÃ 
+    ``fft_data`` puÃ² essere impostata prima di chiamare ``merge_temp_tdms``
     per definire i dati dello spettro.  Quando presente, un segmento
-    aggiuntivo verrà creato contenente un gruppo "FFT" con il canale di
+    aggiuntivo verrÃ  creato contenente un gruppo "FFT" con il canale di
     frequenza e i canali di magnitudine per ciascun segnale.
     """
 
     def __init__(self) -> None:
         """
         Initialise a new TdmsMerger instance.  In addition to the default
-        behaviour of merging time‑domain data, this class can optionally
+        behaviour of merging timeâ€‘domain data, this class can optionally
         append FFT data to the merged file.  The FFT information should be
         supplied via the ``fft_data`` attribute before invoking
         ``merge_temp_tdms``.  ``fft_data`` must be a dictionary with the
@@ -71,7 +72,7 @@ class TdmsMerger:
         # appended.
         self.fft_data: Optional[dict] = None
 
-    # -------------------- utilità interne --------------------
+    # -------------------- utilitÃ  interne --------------------
     def _pick_group(self, td: TdmsFile):
         """Preferisce il gruppo 'Acquisition', altrimenti il primo disponibile."""
         try:
@@ -105,7 +106,7 @@ class TdmsMerger:
 
         This implementation streams each source segment into the final file
         sequentially to avoid loading all data into memory at once. It also
-        performs a post‑merge validation of the resulting file to ensure
+        performs a postâ€‘merge validation of the resulting file to ensure
         temporal consistency. If validation fails, no temporary data is
         removed and a ``RuntimeError`` is raised.
 
@@ -187,7 +188,7 @@ class TdmsMerger:
                     fs = 1.0 / float(seg_dt)
                 except Exception:
                     pass
-            # Capture per‑segment start time in ISO format for metadata
+            # Capture perâ€‘segment start time in ISO format for metadata
             try:
                 if seg_t0 is not None:
                     iso = (_to_py_datetime(seg_t0) or datetime.datetime.now()).isoformat()
@@ -416,10 +417,10 @@ class TdmsMerger:
                 pass
             raise RuntimeError(f"Errore durante il rename atomico: {e}")
 
-        # Post‑merge validation: open the final file and check consistency
+        # Postâ€‘merge validation: open the final file and check consistency
         if not self._validate_merged_file(out_path, fs):
             raise RuntimeError(
-                "Merge non valido: i canali hanno lunghezze inconsistenti o il tempo non è monotono. "
+                "Merge non valido: i canali hanno lunghezze inconsistenti o il tempo non Ã¨ monotono. "
                 "I segmenti originali sono stati conservati per permettere il recupero."
             )
 
