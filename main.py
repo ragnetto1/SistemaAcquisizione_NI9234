@@ -1,8 +1,16 @@
+#miaoooooo
+
 import sys
 from PyQt5 import QtWidgets, QtGui, QtCore
 from ui import AcquisitionWindow
 from acquisition import AcquisitionManager
 from tdms_merge import TdmsMerger
+
+import os, sys
+print("CWD:", os.getcwd())
+print("MAIN:", __file__)
+print("PYTHON:", sys.executable)
+
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
