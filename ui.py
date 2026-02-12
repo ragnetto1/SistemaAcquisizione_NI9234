@@ -1,4 +1,4 @@
-﻿# Data/Ora: 2026-02-12 15:14:36
+# Data/Ora: 2026-02-12 20:38:51
 # ui.py
 from PyQt5 import QtCore, QtWidgets, QtGui
 import sys
@@ -436,6 +436,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # being changed programmatically, preventing reentry in the
         # associated slot.
         self._auto_fft_change: bool = False
+        self._instant_plot_enabled: bool = False
 
         # Whether FFT computation is enabled.  When true, FFT is computed in
         # sliding-window mode from the dedicated FFT buffer.
@@ -593,6 +594,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._instant_legend.setParentItem(self.pgInstant.getPlotItem().graphicsItem())
         self._instant_legend.anchor((0, 1), (0, 1), offset=(10, -10))
         vinst.addWidget(self.pgInstant, 1)
+        self.chkInstantView = QtWidgets.QCheckBox("Abilita visualizzazione")
+        self.chkInstantView.setChecked(False)
+        self.chkInstantView.toggled.connect(self._on_instant_view_toggled)
+        vinst.addWidget(self.chkInstantView)
         tabPlots.addTab(self.tabInstant, "Blocchi istantanei")
 
         # --------------------------------------------------------------
@@ -1817,6 +1822,17 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.acq.stop()
         except Exception:
             pass
+        # Disable FFT on stop without re-entering toggle slot logic.
+        try:
+            self._auto_fft_change = True
+            self.chkFftEnable.setChecked(False)
+        except Exception:
+            pass
+        finally:
+            self._auto_fft_change = False
+        self._fft_enabled = False
+        self._clear_fft_plot_visuals(clear_cached=False)
+
         # cleanup temporary FFT chunk files written on disk (worker thread)
         try:
             self.sigFftWorkerReset.emit(True, True)
@@ -2483,6 +2499,16 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except RuntimeError:
             pass
 
+    def _on_instant_view_toggled(self, checked: bool) -> None:
+        self._instant_plot_enabled = bool(checked)
+        if self._instant_plot_enabled:
+            return
+        for curve in self._instant_curves_by_phys.values():
+            try:
+                curve.clear()
+            except Exception:
+                pass
+
     def _refresh_plots(self):
         # chart concatenato
         n = len(self._chart_x)
@@ -2497,7 +2523,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                     curve.setData(x, y)
 
         # blocco istantaneo
-        if isinstance(self._instant_t, np.ndarray) and self._instant_t.size > 1:
+        if self._instant_plot_enabled and isinstance(self._instant_t, np.ndarray) and self._instant_t.size > 1:
             for phys, curve in self._instant_curves_by_phys.items():
                 y = self._instant_y_by_phys.get(phys)
                 if isinstance(y, np.ndarray) and y.size == self._instant_t.size and y.size > 1:
@@ -2679,6 +2705,24 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _clear_fft_plot_visuals(self, clear_cached: bool = True) -> None:
+        for curve in self._fft_curves_by_phys.values():
+            try:
+                curve.clear()
+            except Exception:
+                pass
+        try:
+            self.lblFftStatus.setText("")
+        except Exception:
+            pass
+        try:
+            self.lblFftPeakInfo.setText("")
+        except Exception:
+            pass
+        if clear_cached:
+            self._last_fft_freq = None
+            self._last_fft_mag_by_phys.clear()
+
     def _on_fft_enable_toggled(self, checked: bool) -> None:
         """
         Enable/disable FFT over the dedicated FFT buffer.
@@ -2709,10 +2753,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self._emit_fft_worker_config()
         else:
             self.sigFftWorkerReset.emit(True, True)
-            try:
-                self.lblFftStatus.setText("")
-            except Exception:
-                pass
+            self._clear_fft_plot_visuals(clear_cached=True)
 
     # ----------------------------- Definisci Tipo Risorsa -----------------------------
     def _open_resource_manager(self):

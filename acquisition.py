@@ -1,4 +1,4 @@
-﻿# Data/Ora: 2026-02-12 15:14:36
+# Data/Ora: 2026-02-12 20:38:51
 # acquisition.py
 import os, math, time, uuid, queue, threading, tempfile, datetime
 from typing import List, Callable, Optional, Dict, Any, Tuple

@@ -1,4 +1,4 @@
-﻿# Data/Ora: 2026-02-12 15:14:36
+# Data/Ora: 2026-02-12 20:38:51
 import os
 import datetime
 import numpy as np
