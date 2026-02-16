@@ -938,6 +938,29 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             metas = []
 
         metas, preferred_idx = self._prioritize_preferred_devices(metas)
+        forced_device_name = self._forced_device_name_from_env()
+        if forced_device_name:
+            forced_idx = -1
+            for idx, meta in enumerate(metas):
+                if str(meta.get("name", "") or "").strip() == forced_device_name:
+                    forced_idx = idx
+                    break
+
+            if forced_idx < 0:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Dispositivo non disponibile",
+                    f'Il dispositivo assegnato "{forced_device_name}" non e disponibile.',
+                )
+                self._abort_startup_on_device_cancel()
+                return
+
+            if forced_idx > 0:
+                ordered = list(metas)
+                target = ordered.pop(forced_idx)
+                ordered.insert(0, target)
+                metas = ordered
+                preferred_idx = 0
 
         self.cmbDevice.blockSignals(True)
         self.cmbDevice.clear()
@@ -957,6 +980,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 self, "Nessun dispositivo",
                 "Nessun NI-9234 trovato. Verifica in NI-MAX (anche simulati)."
             )
+            if forced_device_name:
+                self._abort_startup_on_device_cancel()
+                return
+        elif forced_device_name:
+            self.cmbDevice.setCurrentIndex(0)
         elif len(metas) == 1:
             self.cmbDevice.setCurrentIndex(0)
         else:
@@ -969,6 +997,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             else:
                 self._abort_startup_on_device_cancel()
                 return
+
+        # Se il processo e stato avviato per un device specifico, vincola la selezione.
+        self.cmbDevice.setEnabled(not bool(forced_device_name))
+        self.btnRefresh.setEnabled(not bool(forced_device_name))
 
         self._populate_table()
         self._populate_type_column()
@@ -992,6 +1024,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             is_sim = False
 
         return alias, is_sim
+
+    def _forced_device_name_from_env(self):
+        return str(os.environ.get("CDAQ_TARGET_DEVICE_NAME", "") or "").strip()
 
     def _prioritize_preferred_devices(self, metas):
         if not metas:
