@@ -1,4 +1,4 @@
-# Data/Ora: 2026-02-12 20:38:51
+﻿# Data/Ora: 2026-02-12 20:38:51
 # ui.py
 from PyQt5 import QtCore, QtWidgets, QtGui
 import sys
@@ -32,16 +32,16 @@ COL_ENABLE   = 0
 COL_PHYS     = 1
 COL_TYPE     = 2   # Tipo risorsa (Voltage o sensori dal DB)
 COL_LABEL    = 3   # Nome canale (etichetta utente)
-COL_VALUE    = 4   # Valore istantaneo (con unità se selezionata)
+COL_VALUE    = 4   # Valore istantaneo (con unit? se selezionata)
 COL_ZERO_BTN = 5
 COL_ZERO_VAL = 6
-# New columns for NI‑9234 coupling and sensor limits.
+# New columns for NI-9234 coupling and sensor limits.
 COL_COUPLING = 7
 COL_LIMIT_MAX = 8
 COL_LIMIT_MIN = 9
 
 # Percorso di default richiesto
-# Per la NI‑9234 il progetto utilizza directory dedicate.  I percorsi
+# Per la NI-9234 il progetto utilizza directory dedicate.  I percorsi
 # predefiniti possono essere personalizzati modificando queste costanti.
 DEFAULT_SAVE_DIR = r"C:\UG-WORK\SistemaAcquisizione_NI9234"
 SENSOR_DB_DEFAULT = r"C:\UG-WORK\SistemaAcquisizione_NI9234\Sensor database.xml"
@@ -359,9 +359,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.acq = acq_manager
         self.merger = merger
 
-        # Finestra per il modulo NI‑9234.  In questo progetto non è prevista
+        # Finestra per il modulo NI-9234.  In questo progetto non ? prevista
         # la selezione di altri modelli di scheda.
-        self.setWindowTitle("NI 9234 Acquisition — Demo Architettura")
+        self.setWindowTitle("NI 9234 Acquisition - Demo Architettura")
         self.resize(1200, 740)
 
         # stati UI/logica
@@ -371,13 +371,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # mappature canali
         self._current_phys_order = []                    # ordine fisico corrente avviato
-        # La NI‑9234 ha quattro canali simultanei
+        # La NI-9234 ha quattro canali simultanei
         try:
             num_chans = int(getattr(self.acq, "num_channels", 4))
         except Exception:
             num_chans = 4
         # Inizializza le strutture mappatura e calibrazione per ciascun canale fisico
-        self._label_by_phys = {f"ai{i}": f"ai{i}" for i in range(num_chans)}   # label utente “Nome canale”
+        self._label_by_phys = {f"ai{i}": f"ai{i}" for i in range(num_chans)}   # label utente "Nome canaleâ€
         self._sensor_type_by_phys = {f"ai{i}": "Voltage" for i in range(num_chans)}
         self._calib_by_phys = {f"ai{i}": {"unit":"", "a":1.0, "b":0.0} for i in range(num_chans)}
         self._start_label_by_phys = {}                   # mapping phys -> nome al momento dello start
@@ -443,7 +443,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._fft_enabled: bool = False
         self._reset_fft_buffers()
 
-        # Directory di salvataggio per la NI‑9234 (nessun cambio dinamico per altri modelli)
+        # Directory di salvataggio per la NI-9234 (nessun cambio dinamico per altri modelli)
         self._save_dir = DEFAULT_SAVE_DIR
         self._base_filename = "SenzaNome.tdms"
         self._active_subdir = None
@@ -464,7 +464,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # Track if we are in stall mode to avoid repeated adjustments
         self._stall_active = False
 
-        # Percorso del database sensori per la NI‑9234
+        # Percorso del database sensori per la NI-9234
         self._sensor_db_path = SENSOR_DB_DEFAULT
 
         # UI
@@ -603,7 +603,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # --------------------------------------------------------------
         # FFT tab: mostra il modulo della trasformata di Fourier calcolata
         # sulla finestra temporale del chart concatenato decimato.
-        # Ogni canale è disegnato con colore e legenda dedicati.
+        # Ogni canale ? disegnato con colore e legenda dedicati.
         self.tabFFT = QtWidgets.QWidget()
         vfft = QtWidgets.QVBoxLayout(self.tabFFT)
         # Plot widget for the FFT magnitude spectra.  The title will be
@@ -618,7 +618,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         vfft.addWidget(self.pgFFT, 1)
-        # Controls for FFT computation: duration and log‑scale toggle
+        # Controls for FFT computation: duration and log-scale toggle
         ctrl_layout = QtWidgets.QHBoxLayout()
         # Enable/disable continuous FFT update from the decimated chart tail.
         self.chkFftEnable = QtWidgets.QCheckBox("Abilita FFT")
@@ -700,7 +700,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # Barra salvataggio in basso
         bottom = QtWidgets.QHBoxLayout()
         self.txtSaveDir = QtWidgets.QLineEdit(self._save_dir)
-        self.btnBrowseDir = QtWidgets.QPushButton("Sfoglia cartella…")
+        self.btnBrowseDir = QtWidgets.QPushButton("Sfoglia cartella...")
         self.txtBaseName = QtWidgets.QLineEdit(self._base_filename)
         # SpinBox per impostare la dimensione del buffer in RAM (MB) per il salvataggio
         self.spinRam = QtWidgets.QSpinBox()
@@ -714,8 +714,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.spinRam.setValue(500)
         self.spinRam.setSuffix(" MB")
         self.spinRam.setSingleStep(50)
-        self.btnStart = QtWidgets.QPushButton("Salva dati")            # passa a “Salvo in (xx s)…”
-        self.btnStop = QtWidgets.QPushButton("Stop e ricomponi…")
+        self.btnStart = QtWidgets.QPushButton("Salva dati")            # passa a "Salvo in (xx s)?â€
+        self.btnStop = QtWidgets.QPushButton("Stop e ricomponi...")
         self.btnStop.setEnabled(False)
 
         bottom.addWidget(QtWidgets.QLabel("Percorso salvataggio:"))
@@ -733,10 +733,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         bottom.addWidget(self.btnStop)
         main.addLayout(bottom)
 
-        # Timer per l'aggiornamento dei grafici.  Un intervallo più lungo
+        # Timer per l'aggiornamento dei grafici.  Un intervallo pi? lungo
         # (100 ms invece dei 50 ms precedenti) riduce il numero di
         # conversioni da deque a array e di chiamate a setData, riducendo
-        # l'uso di memoria nel lungo periodo.  Questo valore può essere
+        # l'uso di memoria nel lungo periodo.  Questo valore pu? essere
         # ulteriormente modificato dinamicamente dalla routine di controllo
         # dello stall.
         self.guiTimer = QtCore.QTimer(self)
@@ -746,7 +746,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # Status bar + etichetta sempre visibile con rate
         self.statusBar = QtWidgets.QStatusBar()
         self.setStatusBar(self.statusBar)
-        self.lblRateInfo = QtWidgets.QLabel("—")
+        self.lblRateInfo = QtWidgets.QLabel("-")
         our_font = self.lblRateInfo.font()
         our_font.setPointSize(9)
         self.lblRateInfo.setFont(our_font)
@@ -923,16 +923,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def refresh_devices(self):
         """
         Popola la combo dispositivi includendo anche i moduli simulati.
-        Se sono presenti più NI-9201, apre un dialog per scegliere:
-        mostra 'nome modulo', 'chassis' e tag '[SIMULATED]'.
+        Se sono presenti piu moduli, apre un dialog per scegliere.
         """
-        # usa i metadati completi dal core
         try:
-            # use the appropriate discovery method from the acquisition core
             metas = self.acq.list_current_devices_meta()
         except AttributeError:
-            # retrocompatibility: if the core doesn't provide list_current_devices_meta,
-            # fallback to NI‑9201 discovery.
             try:
                 names = self.acq.list_ni9201_devices()
             except Exception:
@@ -942,7 +937,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             metas = []
 
-        # Aggiorna combo: testo "cDAQ1Mod1 — NI 9201 — (cDAQ1) [SIMULATED]" ma userData=nome pulito
+        metas, preferred_idx = self._prioritize_preferred_devices(metas)
+
         self.cmbDevice.blockSignals(True)
         self.cmbDevice.clear()
         for m in metas:
@@ -950,63 +946,146 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             pt = m.get("product_type", "")
             ch = m.get("chassis", "")
             sim = " [SIMULATED]" if m.get("is_simulated") else ""
-            label = f"{name} — {pt} — ({ch}){sim}" if ch else f"{name} — {pt}{sim}"
+            label = f"{name} - {pt} - ({ch}){sim}" if ch else f"{name} - {pt}{sim}"
             self.cmbDevice.addItem(label, userData=name)
         self.cmbDevice.blockSignals(False)
 
         self._device_ready = bool(metas)
 
-        # scelta automatica / dialog se più device
-        # Messaggi specifici per la NI‑9234
         if not metas:
             QtWidgets.QMessageBox.information(
                 self, "Nessun dispositivo",
-                "Nessun NI‑9234 trovato. Verifica in NI‑MAX (anche simulati)."
+                "Nessun NI-9234 trovato. Verifica in NI-MAX (anche simulati)."
             )
         elif len(metas) == 1:
             self.cmbDevice.setCurrentIndex(0)
         else:
-            chosen = self._prompt_device_choice(metas)
+            chosen = self._prompt_device_choice(metas, preferred_idx=preferred_idx)
             if chosen:
-                # seleziona item con quel name in userData
                 for i in range(self.cmbDevice.count()):
                     if self.cmbDevice.itemData(i) == chosen:
                         self.cmbDevice.setCurrentIndex(i)
                         break
             else:
-                # se l'utente annulla la scelta del dispositivo, termina il programma
-                sys.exit(0)
+                self._abort_startup_on_device_cancel()
+                return
 
-        # come prima: ricostruzione tabella/definizioni/scale
         self._populate_table()
         self._populate_type_column()
         self._recompute_all_calibrations()
-        self.lblRateInfo.setText("—")
+        self.lblRateInfo.setText("-")
 
-    def _prompt_device_choice(self, metas):
+    def _abort_startup_on_device_cancel(self):
+        # Chiusura pulita del modulo: evita sys.exit immediato mentre Qt
+        # ha thread/eventi ancora attivi (es. worker FFT).
+        self._device_ready = False
+        QtCore.QTimer.singleShot(0, self.close)
+
+    def _preferred_chassis_from_env(self):
+        alias = str(os.environ.get("CDAQ_SELECTED_ALIAS", "") or "").strip()
+        raw = str(os.environ.get("CDAQ_SELECTED_SIMULATED", "") or "").strip().lower()
+
+        is_sim = None
+        if raw in ("1", "true", "yes"):
+            is_sim = True
+        elif raw in ("0", "false", "no"):
+            is_sim = False
+
+        return alias, is_sim
+
+    def _prioritize_preferred_devices(self, metas):
+        if not metas:
+            return metas, 0
+
+        preferred_alias, preferred_is_sim = self._preferred_chassis_from_env()
+        if not preferred_alias:
+            return metas, 0
+
+        preferred_idx = -1
+        target_alias = preferred_alias.lower()
+
+        for idx, meta in enumerate(metas):
+            chassis_alias = str(meta.get("chassis", "") or "").strip().lower()
+            if chassis_alias != target_alias:
+                continue
+            is_sim = bool(meta.get("is_simulated"))
+            if preferred_is_sim is None or is_sim == preferred_is_sim:
+                preferred_idx = idx
+                break
+
+        if preferred_idx <= 0:
+            return metas, 0
+
+        ordered = list(metas)
+        preferred_meta = ordered.pop(preferred_idx)
+        ordered.insert(0, preferred_meta)
+        return ordered, 0
+
+    def _prompt_device_choice(self, metas, preferred_idx=0):
         items = []
         for m in metas:
             name = m.get("name", "?")
             pt = m.get("product_type", "")
             ch = m.get("chassis", "")
             sim = " [SIMULATED]" if m.get("is_simulated") else ""
-            label = f"{name} — {pt} — ({ch}){sim}" if ch else f"{name} — {pt}{sim}"
+            label = f"{name} - {pt} - ({ch}){sim}" if ch else f"{name} - {pt}{sim}"
             items.append(label)
-        # Messaggio specifico per la NI‑9234
-        item, ok = QtWidgets.QInputDialog.getItem(
-            self, "Seleziona dispositivo",
-            "Sono presenti più moduli NI‑9234.\nScegli quello da usare:",
-            items, 0, False
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Seleziona dispositivo")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(QtWidgets.QLabel("Sono presenti piu moduli NI-9234.\nScegli quello da usare:"))
+
+        cmb = QtWidgets.QComboBox(dialog)
+        cmb.addItems(items)
+        if cmb.count() > 0:
+            preferred_idx = max(0, min(int(preferred_idx or 0), cmb.count() - 1))
+            cmb.setCurrentIndex(preferred_idx)
+        else:
+            preferred_idx = 0
+        layout.addWidget(cmb)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel, parent=dialog
         )
-        if not ok or not item:
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        state = {"reverting": False}
+
+        def _on_selection_changed(new_idx):
+            if state["reverting"]:
+                return
+            if new_idx < 0 or preferred_idx < 0 or new_idx == preferred_idx:
+                return
+
+            answer = QtWidgets.QMessageBox.question(
+                dialog,
+                "Conferma cambio chassis",
+                "Stai selezionando un dispositivo su chassis diverso da quello scelto precedentemente. Continuare?",
+                QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Cancel,
+            )
+            if answer != QtWidgets.QMessageBox.Ok:
+                state["reverting"] = True
+                cmb.setCurrentIndex(preferred_idx)
+                state["reverting"] = False
+
+        cmb.currentIndexChanged.connect(_on_selection_changed)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return None
-        # estrai il name prima della prima " — "
-        return item.split(" — ", 1)[0]
+
+        chosen_idx = cmb.currentIndex()
+        if chosen_idx < 0 or chosen_idx >= len(metas):
+            return None
+        return str(metas[chosen_idx].get("name", "") or "")
 
     def _on_device_changed(self, _):
         self._stop_acquisition_ui_only()
         self._reset_plots()
-        self.lblRateInfo.setText("—")
+        self.lblRateInfo.setText("-")
 
     # ----------------------------- Sensor defs -----------------------------
     def _read_sensor_defs(self) -> dict:
@@ -1136,7 +1215,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # Dopo aver ricalcolato le calibrazioni e aggiornato le legende,
         # aggiorna anche i suffissi dei limiti per tutte le righe.  Questo
-        # assicura che i campi Limite Max/Min visualizzino l'unità corretta.
+        # assicura che i campi Limite Max/Min visualizzino l'unit? corretta.
         try:
             self._update_limit_units_all()
         except Exception:
@@ -1164,8 +1243,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def _update_limit_units_for_row(self, row: int):
         """
         Aggiorna il suffisso dei campi "Limite Max input" e "Limite Min input"
-        per la riga specificata.  Utilizza l'unità ingegneristica associata al
-        sensore selezionato per quel canale.  Se non c'è unità (ad esempio per
+        per la riga specificata.  Utilizza l'unit? ingegneristica associata al
+        sensore selezionato per quel canale.  Se non c'? unit? (ad esempio per
         "Voltage"), il suffisso viene rimosso.
         """
         # Recupera il nome fisico del canale
@@ -1176,7 +1255,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             phys = ""
         if not phys:
             return
-        # Determina l'unità corrente
+        # Determina l'unit? corrente
         unit = ""
         try:
             unit = self._calib_by_phys.get(phys, {}).get("unit", "")
@@ -1200,8 +1279,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def _update_limit_units_all(self):
         """
         Aggiorna i suffissi dei campi Limite Max/Min per tutte le righe
-        della tabella in base alle unità ingegneristiche attualmente
-        selezionate.  È utile chiamare questo metodo dopo che sono state
+        della tabella in base alle unit? ingegneristiche attualmente
+        selezionate.  Ãˆ utile chiamare questo metodo dopo che sono state
         ricalcolate le calibrazioni o dopo la costruzione della tabella.
         """
         for r in range(self.table.rowCount()):
@@ -1215,10 +1294,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         """
         Popola la tabella dei canali in base al numero di canali disponibili
         per la scheda corrente. Ogni riga rappresenta un canale fisico e
-        contiene colonne per l’abilitazione, la selezione del tipo di
+        contiene colonne per l'abilitazione, la selezione del tipo di
         risorsa (sensore), il nome del canale, il valore istantaneo, il
         reset dello zero, il valore azzerato, il coupling e i limiti
-        dell’ingresso fisico.
+        dell'ingresso fisico.
         """
         self._building_table = True
         try:
@@ -1251,7 +1330,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.table.setItem(i, COL_LABEL, labelItem)
 
             # Valore istantaneo (solo display)
-            valItem = QtWidgets.QTableWidgetItem("—")
+            valItem = QtWidgets.QTableWidgetItem("-")
             valItem.setFlags(valItem.flags() & ~QtCore.Qt.ItemIsUserCheckable & ~QtCore.Qt.ItemIsEditable)
             self.table.setItem(i, COL_VALUE, valItem)
 
@@ -1302,8 +1381,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # Aggiorna i suffissi dei limiti per tutte le righe.  Quando la
         # tabella viene inizializzata i sensori sono impostati su "Voltage",
-        # quindi non hanno unità, ma questa chiamata predispone i controlli
-        # affinché reagiscano correttamente quando il tipo di risorsa
+        # quindi non hanno unit?, ma questa chiamata predispone i controlli
+        # affinch? reagiscano correttamente quando il tipo di risorsa
         # cambia.
         try:
             self._update_limit_units_all()
@@ -1325,14 +1404,14 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._calib_by_phys[phys] = calib
         self._rebuild_legends()
         self._push_sensor_map_to_core()
-        # Aggiorna la configurazione del canale poiché la calibrazione potrebbe
+        # Aggiorna la configurazione del canale poich? la calibrazione potrebbe
         # influire sulla conversione dei limiti.
         try:
             self._on_config_changed_for_row(row)
         except Exception:
             pass
 
-        # Aggiorna i suffissi dei limiti per questa riga in base alla nuova unità.
+        # Aggiorna i suffissi dei limiti per questa riga in base alla nuova unit?.
         try:
             self._update_limit_units_for_row(row)
         except Exception:
@@ -1416,10 +1495,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             # Etichetta digitata dall'utente (fallback al nome fisico se vuota)
             new_label = (item.text() or "").strip() or phys
 
-            # Deduplica il nuovo nome rispetto agli altri canali.  Se esiste già un
+            # Deduplica il nuovo nome rispetto agli altri canali.  Se esiste gi? un
             # altro canale con la stessa etichetta (ignorando la differenza
             # maiuscole/minuscole), appende un suffisso _2, _3, ... fino a trovare
-            # un nome non in uso.  Questa logica evita ambiguità quando i nomi
+            # un nome non in uso.  Questa logica evita ambiguit? quando i nomi
             # duplicati vengono usati per instradare i dati dal core alla UI.
             try:
                 base = new_label
@@ -1434,7 +1513,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                             txt = (it_lbl.text() or "").strip()
                             if txt:
                                 existing.append(txt.lower())
-                    # Se il nuovo nome è già presente, trova un suffisso libero
+                    # Se il nuovo nome ? gi? presente, trova un suffisso libero
                     if base.lower() in existing:
                         suffix = 2
                         candidate = f"{base}_{suffix}"
@@ -1461,15 +1540,15 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-            # Opzionale: aggiorna l'etichetta della frequenza se l'acquisizione è attiva.
+            # Opzionale: aggiorna l'etichetta della frequenza se l'acquisizione ? attiva.
             # Usiamo il flag interno _running invece dello stato del pulsante Stop,
-            # poiché quest'ultimo viene abilitato solo durante il salvataggio.
+            # poich? quest'ultimo viene abilitato solo durante il salvataggio.
             try:
                 if getattr(self.acq, '_running', False):
                     self._update_rate_label(self._current_phys_order)
             except Exception:
                 pass
-            return  # <— importante: NON proseguire
+            return  # <? importante: NON proseguire
 
         # altri casi che possono richiedere riconfigurazione
         if col == COL_ENABLE:
@@ -1514,7 +1593,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         if not phys:
             self._stop_acquisition_ui_only()
-            self.lblRateInfo.setText("—")
+            self.lblRateInfo.setText("-")
             return
 
         # If the set of enabled channels has not changed and an acquisition is
@@ -1600,10 +1679,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.lblRateInfo.setText(
                 f"Canali: {', '.join(labels)}  |  "
                 f"Rate per-canale {cur_per:.1f} kS/s  (agg: {cur_agg:.1f} kS/s)  |  "
-                f"Limiti modulo → single {lim_single:.1f} kS/s, aggregato {lim_multi:.1f} kS/s"
+                f"Limiti modulo â†’ single {lim_single:.1f} kS/s, aggregato {lim_multi:.1f} kS/s"
             )
         except Exception:
-            self.lblRateInfo.setText("—")
+            self.lblRateInfo.setText("-")
 
     def _on_rate_edit_finished(self):
         """
@@ -1706,7 +1785,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.btnStop.setEnabled(False)
         if self.guiTimer.isActive():
             self.guiTimer.stop()
-        self.lblRateInfo.setText("—")
+        self.lblRateInfo.setText("-")
 
     # ----------------------------- TDMS: folder/name, start/stop, countdown -----------------------------
     def _choose_folder(self):
@@ -1749,7 +1828,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 self.acq.set_memory_limit_mb(mem_mb)
         except Exception:
             pass
-        # reset any residual in‑memory blocks before changing the output directory
+        # reset any residual in-memory blocks before changing the output directory
         try:
             if hasattr(self.acq, "clear_memory_buffer"):
                 self.acq.clear_memory_buffer()
@@ -1810,7 +1889,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self.btnStart.setText("Salvataggio")
 
     def _update_start_button_text(self):
-        self.btnStart.setText(f"Salvo in ({self._countdown:02d} s) …")
+        self.btnStart.setText(f"Salvo in ({self._countdown:02d} s) ...")
 
     def _on_stop(self):
         # ferma core
@@ -1878,18 +1957,18 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
             # -----------------------------------------------------------
             # Prepara la struttura dati FFT per l'eventuale salvataggio.
-            # Se è stata calcolata una FFT e l'utente ha richiesto la
+            # Se ? stata calcolata una FFT e l'utente ha richiesto la
             # visualizzazione dello spettro, il dizionario ``fft_data`` viene
             # popolato con la frequenza e le magnitudini.  Questo dizionario
-            # sarà quindi assegnato all'oggetto TdmsMerger, che provvederà ad
+            # sar? quindi assegnato all'oggetto TdmsMerger, che provveder? ad
             # appendere un segmento FFT al file unito.  In assenza di dati
-            # validi, ``fft_data`` resterà None e l'oggetto merger non
-            # aggiungerà il segmento.
+            # validi, ``fft_data`` rester? None e l'oggetto merger non
+            # aggiunger? il segmento.
             try:
                 freq = getattr(self, '_last_fft_freq', None)
                 mags = getattr(self, '_last_fft_mag_by_phys', None)
                 if isinstance(freq, np.ndarray) and freq.size > 0 and isinstance(mags, dict) and mags:
-                    # Costruisci dizionario canali {nome -> array} e unità
+                    # Costruisci dizionario canali {nome -> array} e unit?
                     ch_map = {}
                     units_map = {}
                     for phys, arr in mags.items():
@@ -1903,7 +1982,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                         # Prefix FFT_ per identificare i canali spettro
                         fft_label = f"FFT_{label}"
                         ch_map[fft_label] = arr.astype(np.float64)
-                        # Recupera l'unità ingegneristica associata a questo canale
+                        # Recupera l'unit? ingegneristica associata a questo canale
                         unit = self._calib_by_phys.get(phys, {}).get("unit", "")
                         units_map[fft_label] = unit or ""
                     if ch_map:
@@ -1919,11 +1998,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 # procede con il merge dei soli dati temporali.
                 pass
             # Progress dialog
-            dlg = QtWidgets.QProgressDialog("Unione file TDMS in corso…", "Annulla", 0, 1, self)
+            dlg = QtWidgets.QProgressDialog("Unione file TDMS in corso...", "Annulla", 0, 1, self)
             dlg.setWindowTitle("Unione in corso")
             dlg.setWindowModality(QtCore.Qt.WindowModal)
             dlg.setValue(0)
-            # memorizza la cartella temporanea perché _active_subdir verrà azzerata
+            # memorizza la cartella temporanea perch? _active_subdir verr? azzerata
             tmp_subdir = self._active_subdir
             # Define progress callback
             def _merge_progress(curr: int, total: int):
@@ -2387,8 +2466,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self._instant_legend.addItem(ic, label)
 
             # FFT plot: crea una curva per questo canale e aggiungila alla
-            # legenda FFT.  Non si applica decimazione o clipping qui perché
-            # l'FFT è già un riassunto della finestra selezionata.
+            # legenda FFT.  Non si applica decimazione o clipping qui perch?
+            # l'FFT ? gi? un riassunto della finestra selezionata.
             try:
                 cfft = self.pgFFT.plot(name=label, pen=pg.mkPen(color=color, width=1.5))
             except Exception:
@@ -2396,7 +2475,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             if cfft is not None:
                 try:
                     # Lascio ClipToView disabilitato per l'FFT; eventuale
-                    # riduzione di punti sarà gestita dal calcolo stesso.
+                    # riduzione di punti sar? gestita dal calcolo stesso.
                     pass
                 except Exception:
                     pass
@@ -2693,13 +2772,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     def _on_fft_log_scale_changed(self, checked: bool) -> None:
         """
-        Slot called when the user toggles the log‑scale checkbox.  Sets the
-        FFT plot axes to log‑log mode if checked, otherwise linear.
+        Slot called when the user toggles the log-scale checkbox.  Sets the
+        FFT plot axes to log-log mode if checked, otherwise linear.
         """
         try:
             # PyQtGraph allows separate log settings for x and y axes.  Set
-            # both to the same state to achieve a log‑log or linear‑linear
-            # display.  When switching back to linear, any non‑positive
+            # both to the same state to achieve a log-log or linear-linear
+            # display.  When switching back to linear, any non-positive
             # samples will be handled gracefully by pyqtgraph.
             self.pgFFT.setLogMode(checked, checked)
         except Exception:
@@ -2820,7 +2899,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             gen['ram_mb'] = str(int(self.spinRam.value()))
         except Exception:
             gen['ram_mb'] = ""
-        # Frequenza di campionamento (può essere stringa vuota o "Max")
+        # Frequenza di campionamento (pu? essere stringa vuota o "Max")
         txt = (self.rateEdit.text() or "").strip()
         gen['fs'] = txt
         # Nome del device corrente
@@ -2905,7 +2984,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         """
         Carica una configurazione da un file INI e applica tutte le impostazioni:
         cartella di salvataggio, base filename, buffer RAM, frequenza, lista canali e database sensori.
-        Prima del caricamento viene verificata la compatibilità tra il modello
+        Prima del caricamento viene verificata la compatibilit? tra il modello
         di scheda salvato nel workspace (campo ``supporteddaq``) e la scheda
         attualmente selezionata; se non coincidono viene mostrato un errore.
         """
@@ -2936,7 +3015,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             supported_list = [s.strip().upper() for s in supported.split(',') if s.strip()]
             if bt.upper() not in supported_list:
                 QtWidgets.QMessageBox.critical(self, "Errore",
-                    f"Il workspace non è compatibile con {bt}.")
+                    f"Il workspace non e compatibile con {bt}.")
                 return
         # Aggiorna percorso DB sensori
         sensor_db = gen.get('sensor_db_path', '').strip()
@@ -3082,7 +3161,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                     if zero_disp:
                         self.table.item(r, COL_ZERO_VAL).setText(zero_disp)
                     else:
-                        # se non c'è display, mostra 0.0 per coerenza
+                        # se non c'? display, mostra 0.0 per coerenza
                         try:
                             self.table.item(r, COL_ZERO_VAL).setText('0.0')
                         except Exception:
@@ -3093,12 +3172,12 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     # ----------------------------- Channel helpers per ResourceManager -----------------------------
     def is_channel_enabled(self, phys: str) -> bool:
-        """Restituisce True se il canale fisico è abilitato nella tabella."""
+        """Restituisce True se il canale fisico ? abilitato nella tabella."""
         try:
             for r in range(self.table.rowCount()):
                 phys_item = self.table.item(r, COL_PHYS)
                 if phys_item and phys_item.text() == phys:
-                    # colonna abilita è una QTableWidgetItem con stato di check
+                    # colonna abilita ? una QTableWidgetItem con stato di check
                     enable_item = self.table.item(r, COL_ENABLE)
                     if enable_item:
                         return enable_item.checkState() == QtCore.Qt.Checked
@@ -3190,7 +3269,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
     def _on_zero_button_clicked(self, phys: str):
         """
         Azzeramento canale:
-        - Legge il valore istantaneo ATTUALE (in unità ingegneristiche)
+        - Legge il valore istantaneo ATTUALE (in unit? ingegneristiche)
         - Lo mostra in colonna 'Valore azzerato'
         - Fissa lo zero nel core come valore RAW (Volt) dell'istante
         """
@@ -3199,13 +3278,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         if r < 0:
             return
 
-        # 1) valore istantaneo in unità ingegneristiche (quello che vedi in UI)
+        # 1) valore istantaneo in unit? ingegneristiche (quello che vedi in UI)
         try:
             val_eng = self.acq.get_last_engineered(phys)
         except Exception:
             val_eng = None
 
-        # unità per visualizzazione
+        # unit? per visualizzazione
         unit = self._calib_by_phys.get(phys, {}).get("unit", "")
         if val_eng is not None:
             txt = f"{val_eng:.6g}" + (f" {unit}" if unit else "")
@@ -3242,7 +3321,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             it = self.table.item(r, COL_ENABLE)
             if it:
                 if lock:
-                    # rimuovo la possibilità di spuntare
+                    # rimuovo la possibilit? di spuntare
                     it.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
                 else:
                     # riabilito la spunta
@@ -3284,7 +3363,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                     it.setCheckState(QtCore.Qt.Unchecked)
         finally:
             self._auto_change = False
-        # applica lo stato all’acquisizione
+        # applica lo stato all'acquisizione
         self._update_acquisition_from_table()
+
 
 
