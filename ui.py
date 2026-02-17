@@ -432,6 +432,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # _refresh_plots().
         self._last_fft_freq: Optional[np.ndarray] = None
         self._last_fft_mag_by_phys: Dict[str, np.ndarray] = {}
+        # Monotonic counters used to ensure only the latest FFT computed during
+        # the current recording window is eligible for TDMS export.
+        self._fft_result_counter: int = 0
+        self._fft_result_counter_at_record_start: int = 0
 
         # Flag used internally to indicate that the FFT enable checkbox is
         # being changed programmatically, preventing reentry in the
@@ -930,10 +934,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             metas = self.acq.list_current_devices_meta()
         except AttributeError:
             try:
-                names = self.acq.list_ni9201_devices()
+                names = self.acq.list_ni9234_devices()
             except Exception:
                 names = []
-            metas = [{"name": n, "product_type": "NI 9201", "is_simulated": False,
+            metas = [{"name": n, "product_type": "NI 9234", "is_simulated": False,
                       "chassis": n.split("Mod")[0] if "Mod" in n else ""} for n in names]
         except Exception:
             metas = []
@@ -1088,28 +1092,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
 
-        state = {"reverting": False}
-
-        def _on_selection_changed(new_idx):
-            if state["reverting"]:
-                return
-            if new_idx < 0 or preferred_idx < 0 or new_idx == preferred_idx:
-                return
-
-            answer = QtWidgets.QMessageBox.question(
-                dialog,
-                "Conferma cambio chassis",
-                "Stai selezionando un dispositivo su chassis diverso da quello scelto precedentemente. Continuare?",
-                QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel,
-                QtWidgets.QMessageBox.Cancel,
-            )
-            if answer != QtWidgets.QMessageBox.Ok:
-                state["reverting"] = True
-                cmb.setCurrentIndex(preferred_idx)
-                state["reverting"] = False
-
-        cmb.currentIndexChanged.connect(_on_selection_changed)
-
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return None
 
@@ -1140,10 +1122,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         # Determine supported DAQ models for this application. The program
         # must load only sensors compatible with the current board type.
         try:
-            bt = getattr(self.acq, "board_type", "NI9201")
+            bt = getattr(self.acq, "board_type", "NI9234")
         except Exception:
-            bt = "NI9201"
-        supported_daqlist = [bt.upper()]
+            bt = "NI9234"
+        board_tag = str(bt or "NI9234").strip().upper()
         try:
             tree = ET.parse(p)
             root = tree.getroot()
@@ -1165,7 +1147,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                     # If a supportedDAQ tag is present, ensure the current board appears among the comma-separated values
                     if supported:
                         items = [x.strip().upper() for x in supported.split(",") if x.strip()]
-                        if all(item != bt.upper() for item in items):
+                        if all(item != board_tag for item in items):
                             continue
                     else:
                         # If the tag does not exist or is empty, do not include the sensor
@@ -1222,7 +1204,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             cur = cmb.currentText()
             cmb.blockSignals(True)
             cmb.clear()
-            cmb.setEditable(True)
+            cmb.setEditable(False)
             cmb.addItem("Voltage")
             for n in names:
                 cmb.addItem(n)
@@ -1231,7 +1213,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 if idx >= 0:
                     cmb.setCurrentIndex(idx)
                 else:
-                    cmb.setEditText(cur)
+                    cmb.setCurrentIndex(0)
             else:
                 cmb.setCurrentIndex(0)
             cmb.blockSignals(False)
@@ -1354,9 +1336,9 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             physItem.setFlags(physItem.flags() & ~QtCore.Qt.ItemIsEditable)
             self.table.setItem(i, COL_PHYS, physItem)
 
-            # Tipo risorsa (sensore): combobox modificabile
+            # Tipo risorsa (sensore): selezione vincolata ai sensori supportati + Voltage
             cmbType = QtWidgets.QComboBox()
-            cmbType.setEditable(True)
+            cmbType.setEditable(False)
             cmbType.addItem("Voltage")
             cmbType.currentTextChanged.connect(lambda _t, row=i: self._type_changed_for_row(row))
             self.table.setCellWidget(i, COL_TYPE, cmbType)
@@ -1876,6 +1858,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.acq.set_base_filename(base_name)
         # enable recording so the writer will start accumulating blocks in RAM
         self.acq.set_recording(True)
+        # Mark the FFT baseline for this recording and clear any stale spectrum
+        # from previous runs.
+        self._fft_result_counter_at_record_start = int(self._fft_result_counter)
+        self._last_fft_freq = None
+        self._last_fft_mag_by_phys.clear()
 
         # Now that recording is active, the Stop/Recompose button can be used to
         # stop and merge the temporary TDMS files.  Enable it explicitly.
@@ -2003,7 +1990,11 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             try:
                 freq = getattr(self, '_last_fft_freq', None)
                 mags = getattr(self, '_last_fft_mag_by_phys', None)
-                if isinstance(freq, np.ndarray) and freq.size > 0 and isinstance(mags, dict) and mags:
+                fresh_fft_for_recording = (
+                    int(getattr(self, "_fft_result_counter", 0))
+                    > int(getattr(self, "_fft_result_counter_at_record_start", 0))
+                )
+                if fresh_fft_for_recording and isinstance(freq, np.ndarray) and freq.size > 0 and isinstance(mags, dict) and mags:
                     # Costruisci dizionario canali {nome -> array} e unit?
                     ch_map = {}
                     units_map = {}
@@ -2744,6 +2735,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys))
                 unit = self._calib_by_phys.get(phys, {}).get('unit', '')
                 peak_strings.append(f"{label}: {amp_peak:.3g}{(' ' + unit) if unit else ''} @ {f_peak:.6g} Hz")
+        if self._last_fft_mag_by_phys:
+            self._fft_result_counter += 1
         for phys, curve in self._fft_curves_by_phys.items():
             if phys not in self._last_fft_mag_by_phys:
                 try:
@@ -3193,7 +3186,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                     if pos >= 0:
                         cmb.setCurrentIndex(pos)
                     else:
-                        cmb.setEditText(tval)
+                        cmb.setCurrentIndex(0)
                 else:
                     cmb.setCurrentIndex(0)
 

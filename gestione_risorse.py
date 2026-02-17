@@ -75,11 +75,18 @@ class ResourceManagerDialog(QtWidgets.QDialog):
 
         # Imposta il valore predefinito per il campo "Schede compatibili" al modello corrente.
         try:
-            bt = getattr(self.acq, "board_type", "")
-            if bt:
-                self.txtSupportedDAQ.setText(str(bt))
+            self.txtSupportedDAQ.setText(self._default_supported_daq_text())
         except Exception:
             pass
+
+    def _default_supported_daq_text(self) -> str:
+        try:
+            bt = str(getattr(self.acq, "board_type", "") or "").strip().upper()
+            if bt:
+                return bt
+        except Exception:
+            pass
+        return "NI9234"
 
     # ---- UI ----
     def _build_ui(self):
@@ -408,8 +415,8 @@ class ResourceManagerDialog(QtWidgets.QDialog):
         self.txtUnit.setText("")
         # Imposta il campo supportedDAQ al valore predefinito quando non è selezionato alcun sensore
         try:
-            # Il valore predefinito include i modelli NI9201 e NI9202 per compatibilità futura
-            self.txtSupportedDAQ.setText("NI9201,NI9202")
+            # Valore predefinito allineato alla scheda del modulo corrente.
+            self.txtSupportedDAQ.setText(self._default_supported_daq_text())
         except Exception:
             pass
         self._clear_points()
@@ -450,11 +457,11 @@ class ResourceManagerDialog(QtWidgets.QDialog):
                 self.txtSupportedDAQ.setText(sup)
             else:
                 # Se non è definito, imposta il valore predefinito
-                self.txtSupportedDAQ.setText("NI9201,NI9202")
+                self.txtSupportedDAQ.setText(self._default_supported_daq_text())
         except Exception:
             # In caso di eccezione lascio il default
             try:
-                self.txtSupportedDAQ.setText("NI9201,NI9202")
+                self.txtSupportedDAQ.setText(self._default_supported_daq_text())
             except Exception:
                 pass
         # carica punti (nuovo schema), altrimenti da vecchio schema
@@ -552,8 +559,8 @@ class ResourceManagerDialog(QtWidgets.QDialog):
 
         # Crea elementi unit e supportedDAQ con il valore corrente
         sup_elem = ET.Element(XML_SUPPORTED_DAQ)
-        # Se il campo è vuoto, usa la stringa predefinita con NI9201 e NI9202
-        sup_elem.text = supported_daq_text if supported_daq_text else "NI9201,NI9202"
+        # Se il campo è vuoto, usa la stringa predefinita del modulo corrente.
+        sup_elem.text = supported_daq_text if supported_daq_text else self._default_supported_daq_text()
         unit_elem = ET.Element(XML_UNIT)
         unit_elem.text = unit
 
