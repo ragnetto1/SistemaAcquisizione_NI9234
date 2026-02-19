@@ -252,6 +252,15 @@ class FFTDiskWorker(QtCore.QObject):
         if isinstance(freq_ref, np.ndarray) and mag_map:
             self.sigResult.emit(freq_ref, mag_map, peak_text)
 
+    def _should_abort(self) -> bool:
+        try:
+            th = QtCore.QThread.currentThread()
+            if th is not None and th.isInterruptionRequested():
+                return True
+        except Exception:
+            pass
+        return False
+
     @QtCore.pyqtSlot(object)
     def configure(self, cfg: object) -> None:
         if not isinstance(cfg, dict):
@@ -310,6 +319,8 @@ class FFTDiskWorker(QtCore.QObject):
     @QtCore.pyqtSlot(object)
     def process_block(self, payload: object) -> None:
         try:
+            if self._should_abort():
+                return
             if not isinstance(payload, dict):
                 return
             t = np.asarray(payload.get("t", []), dtype=np.float64)
@@ -344,6 +355,8 @@ class FFTDiskWorker(QtCore.QObject):
             if elapsed < target:
                 return
 
+            if self._should_abort():
+                return
             t_all, y_all, merged_path = self._merge_window(fs_eff)
             if isinstance(t_all, np.ndarray) and isinstance(y_all, dict):
                 self._emit_fft(t_all, y_all, fs_eff)
