@@ -3707,7 +3707,6 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         try:
             if self._sync_agent is not None:
                 self._sync_agent.close()
-                self._sync_agent.deleteLater()
                 self._sync_agent = None
         except BaseException:
             pass
