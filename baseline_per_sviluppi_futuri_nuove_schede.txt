@@ -1,0 +1,771 @@
+﻿BASELINE TECNICA UFFICIALE PER SVILUPI FUTURI - MODULO NI9234
+Progetto: SistemaAcquisizione_CDAQ
+Data baseline: 2026-03-05
+Owner baseline: Project Lead (Codex)
+Target utilizzo: contesto completo per creare nuovi moduli (es. NI9229) mantenendo piena compatibilita con root orchestration, standalone e pipeline TDMS.
+
+====================================================================
+1) SCOPO DEL DOCUMENTO
+====================================================================
+Questo documento cristallizza la baseline tecnica del modulo NI9234 cosi come implementato nel repository corrente.
+Obiettivo: fornire una specifica operativa dettagliata e riusabile per replicare architettura, comportamento e standard qualitativi su nuove schede NI senza regressioni.
+
+La baseline copre:
+- Architettura software e separazione responsabilita
+- Contratti runtime tra UI, core acquisizione, writer, merge e root chassis
+- Schema dati (workspace, sensor DB, TDMS metadata)
+- Comportamenti UI e vincoli funzionali
+- Pipeline FFT e canali calcolati
+- Gestione errori, chiusura risorse e robustezza
+- Delta analysis iniziale per adattamento NI9229
+
+====================================================================
+2) PERIMETRO E VINCOLI DI BASELINE
+====================================================================
+2.1 Perimetro modulo NI9234
+- Modulo dedicato a NI9234 (4 canali analogici simultanei)
+- UI PyQt5 con tab Canali, Canali Calcolati, Grafici (Chart, Instant, FFT)
+- Acquisizione continua via NI-DAQmx callback Every N Samples
+- Salvataggio TDMS segmentato in RAM + flush su file temporanei
+- Merge finale TDMS con validazione e opzionale segmento FFT
+- Compatibile sia standalone sia orchestrazione root (sync agent)
+
+2.2 Vincoli architetturali da mantenere nei nuovi moduli
+- Processo separato per modulo
+- UI come orchestratore locale, AcquisitionManager come core real-time
+- Thread separati per acquisizione, writer e worker FFT
+- Root orchestration via ModuleSyncAgent e comandi sincronizzati
+- Nessun crash UI causato da eccezioni callback
+- Chiusura pulita di task DAQ, thread, timer, socket sync
+
+====================================================================
+3) STRUTTURA FILE NI9234 E RESPONSABILITA
+====================================================================
+3.1 Entry e bootstrap
+- main.py
+  - Entry ufficiale del modulo
+  - Crea QApplication se assente
+  - Istanzia AcquisitionManager + AcquisitionWindow + TdmsMerger
+  - Esegue bootstrap obbligatorio tramite UI avvio e import moduli.py
+
+- UI avvio e import moduli.py
+  - Splash/startup con progress bar import moduli
+  - Import sequence: acquisition -> tdms_merge -> ui -> main
+  - Se fallisce import, popup errore e stop
+  - Se ok, lancia main.main()
+
+3.2 Core runtime
+- ui.py
+  - Finestra principale AcquisitionWindow
+  - Costruzione UI, segnali, wiring callbacks
+  - Gestione devices, canali, tipi risorsa, zeroing, grafici, FFT
+  - Gestione workspace save/load
+  - Gestione sync agent + comandi root
+  - Flusso start save / stop / merge finale
+
+- acquisition.py
+  - AcquisitionManager (core I/O e data plane)
+  - Device discovery e capability rates
+  - Start/stop/stop_graceful task NI-DAQmx
+  - Callback data ingestion
+  - Queue verso writer thread
+  - Writer TDMS con metadata waveform coerenti
+  - Gating sync via write cutoff index
+  - Applicazione zero, calibrazione ingegneristica, canali calcolati
+
+- tdms_merge.py
+  - TdmsMerger
+  - Merge streaming segmenti temporanei in TDMS finale
+  - Preserva metadata canali
+  - forced_wf_start_time supportato
+  - append opzionale segmento FFT
+  - validazione post-merge
+
+3.3 Sottosistemi specialistici
+- gestione_risorse.py
+  - ResourceManagerDialog per editing sensor DB XML
+  - supporto calibrature multi-punto e retrocompat 2-punti
+  - campo supportedDAQ per filtraggio sensori per scheda
+
+- calculated_channels_engine.py
+  - Parser/validator AST sicuro per formule
+  - supporto aiX, ccX, Fs
+  - supporto expression e function mode (def ccX(...))
+  - helper stateful: max/min storico, media corrente, media mobile
+
+- formula_editor_dialog.py / formula_examples_dialog.py
+  - editing formula con help contestuale
+  - esempi formula pronti all'uso
+
+- FFT calculation.py
+  - override opzionale del worker FFT (se presente e importabile)
+
+3.4 Configurazioni
+- settings.json
+  - persistenza impostazioni base UI
+- ws.ini
+  - esempio workspace con sezioni device-specific
+- Sensor database.xml
+  - DB sensori/calibrazioni
+
+====================================================================
+4) MODELLO ARCHITETTURALE E THREADING
+====================================================================
+4.1 Thread model
+- Main/UI thread:
+  - Rendering UI, input utente, status, orchestrazione
+  - Gestione sync commands via ModuleSyncAgent queue processing
+
+- NI-DAQmx callback thread:
+  - Esegue _on_every_n_samples
+  - Legge blocco campioni, aggiorna last raw, enqueue verso writer
+  - Emissione callback thread-safe verso UI (via segnali)
+
+- Writer thread:
+  - Consuma queue campioni
+  - Applica gating sync_cutoff
+  - Accumula in RAM fino a memory_limit
+  - Flusha su segmenti TDMS temporanei
+
+- FFT worker thread:
+  - Riceve blocchi e costruisce finestra FFT su disco
+  - Calcola spettro e invia risultato UI
+
+4.2 Principi di isolamento
+- UI non fa I/O pesante nei path critici di acquisizione
+- Core acquisizione non dipende da widget UI
+- Merge finale eseguito a stop con progress dialog
+- Errori locali loggati o pop-up senza mandare in fault pipeline globale
+
+====================================================================
+5) DISCOVERY DEVICE E RATE MODEL
+====================================================================
+5.1 Discovery
+- list_ni9234_devices_meta:
+  - filtra device con product_type contenente 9234 o 4 AI channel
+  - include is_simulated e chassis alias
+- refresh_devices in UI:
+  - costruisce combo dispositivi
+  - supporta priorita da env chassis selection
+  - supporta lock su device forzato via CDAQ_TARGET_DEVICE_NAME
+
+5.2 Rate model
+- _read_device_caps:
+  - prova a leggere ai_max_single_chan_rate e ai_max_multi_chan_rate
+  - fallback NI9234: single 51200 Hz, multi 51200 * num_channels
+- _compute_per_channel_rate(device, n_channels)
+  - n=1 => single_max
+  - n>1 => agg_max / n
+- set_user_rate_hz:
+  - Fs utente opzionale (clamp a max hardware)
+  - "Max" o empty => auto max
+
+5.3 Semantica Fs in NI9234 baseline
+- Fs rappresenta frequenza di campionamento per canale
+- current_agg_rate_hz = Fs * numero_canali_attivi
+- etichetta status mostra per-channel + aggregato + limiti modulo
+
+====================================================================
+6) UI E FUNZIONALITA OPERATIVE
+====================================================================
+6.1 Barra superiore
+- Rileva schede
+- Combo dispositivo
+- Fs [Hz]
+- Definisci Tipo Risorsa
+- Salva workspace / Carica workspace
+
+6.2 Tab Canali (10 colonne)
+- Abilita (checkbox)
+- Canale fisico (ai0..)
+- Tipo risorsa (Voltage + sensori supportati)
+- Nome canale (label utente)
+- Valore istantaneo (in unita ingegneristica)
+- Azzeramento (button)
+- Valore azzerato (display baseline)
+- Coupling (DC, AC, IEPE + AC)
+- Limite Max input (in unita sensore)
+- Limite Min input (in unita sensore)
+
+6.3 Tab Canali Calcolati
+- Colonne:
+  - Abilita
+  - Canale calcolato (ccX)
+  - Formula
+  - Nome canale
+  - Valore istantaneo
+  - Azzeramento
+  - Valore azzerato
+  - Visualizza nel grafico
+- Limite massimo canali calcolati: 30
+- Pulsanti:
+  - Aggiungi canale di calcolo
+  - Reset calcoli
+
+6.4 Tab Grafici
+- Chart concatenato decimato
+- Blocchi istantanei (ultimo blocco)
+- FFT (durata configurabile, log-log opzionale, assi manuali/auto)
+
+6.5 Barra inferiore
+- Percorso salvataggio
+- Nome file
+- Buffer RAM (MB)
+- Salva dati
+- Stop e ricomponi
+
+====================================================================
+7) PIPELINE ACQUISIZIONE LIVE
+====================================================================
+7.1 Trigger start acquisizione
+- Cambio check canali abilitati
+- Cambio Fs (se running, restart acquisizione)
+- Cambio device (stop + reset plot)
+
+7.2 start() core
+- Crea task NI-DAQmx
+- Aggiunge canali AI con range calcolato da limiti sensore convertiti in Volt
+- Applica coupling/IEPE quando supportato
+- Configura timing continuo
+- Registra callback every_n_samples
+- Avvia writer thread
+- Start task
+
+7.3 callback _on_every_n_samples
+- Legge buffer float64 [nch x nsamples]
+- Inizializza t0 con first block o sync anchor
+- Aggiorna _last_raw per canale
+- Applica zero (shift raw) + calibrazione a*x+b per UI channel value
+- Enqueue blocco grezzo verso writer con global_start_index
+- Emissione blocco instant e chart decimato
+
+7.4 Robustezza callback
+- try/except su tutte le callback UI
+- errori non interrompono task
+- early return se stop/closing/task non valido
+
+====================================================================
+8) AZZERAMENTO (ZEROING) - SEMANTICA BASELINE
+====================================================================
+8.1 Canali fisici
+Quando si preme Azzeramento su un canale:
+- Legge valore ingegneristico istantaneo e lo mostra in "Valore azzerato"
+- Salva baseline RAW (Volt) nel core via set_zero_raw
+- Da quel momento i valori visualizzati e scritti diventano:
+  valore_raw - baseline_raw -> calibrazione a*x+b
+
+8.2 Canali calcolati
+- _calc_zero_by_cc memorizza baseline del canale ccX
+- output formula viene shiftato sottraendo zero calcolato
+
+8.3 Persistenza
+- zero_raw e zero_display dei canali fisici salvati in workspace
+- zero canali calcolati salvato in rows_json
+
+====================================================================
+9) SENSOR DB E GESTIONE RISORSE
+====================================================================
+9.1 Formato XML supportato
+- Root: Sensors
+- Item: Sensor
+- Campi principali:
+  - NomeRisorsa
+  - GrandezzaFisica
+  - supportedDAQ (CSV: es. NI9234,NI9229)
+  - CalibrationPoints/Point(volt,value) [nuovo]
+  - Valore1Volt/Valore1/Valore2Volt/Valore2 [legacy]
+
+9.2 Regole caricamento sensori in UI
+- Sensore mostrato solo se supportedDAQ include board_type corrente
+- Se supportedDAQ mancante o vuoto: sensore escluso
+- Calibrazione calcolata come best-fit lineare multi-punto
+- fallback 2 punti legacy se multi-punti assente
+
+9.3 ResourceManagerDialog
+- Editor punti calibrazione con misura live da canale di riferimento
+- Almeno 2 punti
+- Plot live + retta best-fit
+- Salvataggio XML con unita e supportedDAQ
+
+====================================================================
+10) CANALI CALCOLATI - ENGINE E PARSER
+====================================================================
+10.1 Input ammessi formula
+- aiX
+- ccX
+- Fs
+- np / sp / pd
+- helper stateful:
+  - max_storico, min_storico
+  - media_corrente
+  - media_mobile
+  - alias inglesi equivalenti
+
+10.2 Modalita formula
+- Espressione singola (eval)
+- Funzione def ccX(...): ... (exec)
+
+10.3 Safety model AST
+- vietati import, global/nonlocal, class, lambda, while, try/except, with, delete, raise, await/yield
+- vietate call pericolose: eval, exec, open, compile, getattr, setattr, ecc.
+- vietati nomi/attributi __*
+
+10.4 Runtime model
+- compile con dependency extraction
+- ordinamento topologico dipendenze ccX
+- evaluate su blocco corrente con fill_value per mismatch
+- gestione errori compile/runtime per singolo ccX
+
+====================================================================
+11) SALVATAGGIO TDMS - PIPELINE DETTAGLIATA
+====================================================================
+11.1 Avvio salvataggio (_on_start_saving)
+- Richiede acquisizione attiva
+- Crea subdir temporanea timestampata
+- Propaga label canali e formule al core
+- Imposta memory_limit da spinRam
+- clear_memory_buffer prima nuova sessione
+- set_output_directory(subdir)
+- set_base_filename
+- set_recording(True)
+- lock UI editing
+
+11.2 Writer loop (acquisition.py)
+- Se recording=False:
+  - flush eventuale RAM
+  - drena queue
+- Se sync hold attivo (cutoff enorme sentinel): attende senza consumare queue
+- Se recording=True:
+  - consuma blocchi dalla queue
+  - applica sync gate su start_index/end_index
+  - accumula RAM fino a soglia
+  - flush_memory quando memory_limit raggiunto
+
+11.3 flush_memory
+- Ordina blocchi per indice globale
+- Calcola start_time assoluto da t0 + seg_start_idx/Fs
+- Scrive file temporaneo .tmp e poi rename atomico .tdms
+- Scrive segmenti TDMS con:
+  - RootObject metadata waveform e sync
+  - GroupObject("Acquisition")
+  - Channel Time
+  - Canali fisici in unita ingegneristica
+  - Canali calcolati abilitati
+
+11.4 Metadata TDMS principali (root)
+- sample_rate
+- channels
+- start_index
+- chunk_offset
+- start_time_epoch_s
+- segment_start_time_iso
+- sync_anchor_epoch_s
+- sync_write_cutoff_index
+- wf_start_time
+- wf_increment
+
+11.5 Metadata canali fisici
+- Description / description
+- Unit / unit_string
+- wf_start_time
+- wf_increment
+- physical_channel
+- scale_a
+- scale_b
+- zero_applied
+
+11.6 Metadata canali calcolati
+- calculated_channel_id
+- formula
+- runtime_error (se presente)
+- wf_start_time
+- wf_increment
+
+====================================================================
+12) STOP, MERGE E VALIDAZIONE
+====================================================================
+12.1 stop_graceful
+- Abilita recording per catturare residuo
+- Attende breve drain
+- Legge campioni residui da buffer hardware
+- Enqueue blocchi finali
+- Disabilita callback
+- Chiude recording
+- stop/close task
+- stop/join writer
+
+12.2 _on_stop UI
+- stop_graceful + stop fallback
+- disabilita FFT e cleanup worker files
+- riabilita campi UI
+- calcola final_path evitando overwrite (suffix datetime se necessario)
+- istanzia TdmsMerger e merge folder temporanea
+- mostra progress dialog con cancellazione
+- se merge ok: elimina folder temporanea
+- reset stato sync gate/anchor
+- unlock table, uncheck canali
+
+12.3 TdmsMerger comportamento
+- scan segmenti .tdms ordinati
+- prima pass: metadata, fs, t0, canali
+- seconda pass streaming write su file finale
+- supporto forced_wf_start_time
+- append opzionale segmento FFT
+- rename atomico tmp -> final
+- validazione finale:
+  - Time esiste e monotono
+  - dt approx costante
+  - lunghezze canali coerenti con Time
+
+====================================================================
+13) FFT PIPELINE
+====================================================================
+13.1 Modalita
+- Worker dedicato su thread separato
+- Buffer finestra su disco (non solo RAM)
+- Durata FFT configurabile
+- Opzione log-log
+- visualizzazione picchi dominanti
+
+13.2 Export FFT su TDMS finale
+- A stop, se FFT fresh durante recording:
+  - merger.fft_data valorizzato
+  - segmento gruppo "FFT" con:
+    - Frequency [Hz]
+    - canali FFT_<label>
+    - units map
+    - fft_duration metadata
+
+====================================================================
+14) ROOT ORCHESTRATION - CONTRATTO MODULO
+====================================================================
+14.1 Attivazione ModuleSyncAgent
+ModuleSyncAgent e attivo solo se env validi:
+- CDAQ_SYNC_HOST
+- CDAQ_SYNC_PORT
+- CDAQ_SYNC_SESSION_ID
+- CDAQ_SYNC_MODULE_ID
+
+Altri env usati dalla UI:
+- CDAQ_TARGET_DEVICE_NAME (lock su device assegnato)
+- CDAQ_SELECTED_ALIAS
+- CDAQ_SELECTED_SIMULATED
+
+14.2 Handler registrati
+- APPLY_CHASSIS_CONFIG
+- STATUS_SNAPSHOT
+- PREPARE_SAVE
+- CONFIGURE_SYNC
+- ARM_ACQUISITION
+- START_SYNC
+- START_SAVE
+- SET_SYNC_WRITE_CUTOFF
+- STOP_AND_MERGE
+- UNLOCK_UI
+- ABORT_PREPARED
+- SHUTDOWN
+
+14.3 STATUS_SNAPSHOT payload
+- module_id
+- device_name
+- active_channels
+- fs_max_hz
+- current_rate_hz
+- is_simulated
+- running
+- recording
+- samples_acquired
+
+14.4 Sync timing semantics
+- START_SYNC supporta mode software/hardware
+- hardware slave puo usare:
+  - start_trigger_source
+  - sample_clock_mode
+  - sample_clock_source
+  - sample_clock_edge
+  - sample_clock_rate_hz
+- sample clock condiviso fallback a clock locale se non disponibile
+- sync_anchor_epoch_ns usato per allineare t0
+- write gating:
+  - hold iniziale impostando cutoff sentinel alto
+  - SET_SYNC_WRITE_CUTOFF applica N0 comune
+  - scrittura solo campioni index >= N0
+
+====================================================================
+15) WORKSPACE E PERSISTENZA CONFIG
+====================================================================
+15.1 settings.json (persistenza base UI)
+Chiavi tipiche:
+- save_dir
+- base_filename
+- ram_mb
+- fs
+
+15.2 workspace .ini (device specific)
+Schema dinamico per device:
+- ws.<DAQ>.<DEVICE>.general
+- ws.<DAQ>.<DEVICE>.channels
+- ws.<DAQ>.<DEVICE>.calculated_channels
+
+General include:
+- sensor_db_path
+- supporteddaq
+- device_name
+- save_dir
+- base_filename
+- ram_mb
+- fs
+
+Channels include:
+- phys
+- enabled
+- type
+- label
+- zero_raw
+- zero_display
+
+Calculated include:
+- rows_json (lista configurazioni cc)
+
+15.3 Regole save/load
+- Se device gia presente: richiesta conferma overwrite
+- Se assente: crea nuova entry base unica
+- Load applica:
+  - path, file, ram, fs
+  - tabella canali e tipi sensore
+  - zero raw/display
+  - canali calcolati completi
+
+====================================================================
+16) GESTIONE RISORSE E CHIUSURA PULITA
+====================================================================
+16.1 In chiusura finestra
+- close sync agent
+- salva config
+- stop timers UI/count/backlog
+- stop recording e acquisizione
+- reset/disconnect segnali FFT worker
+- requestInterruption + quit + wait thread FFT
+- disconnessione segnali principali
+
+16.2 Error handling
+- Popup user-facing per errori operativi
+- try/except estesi nei callback per resilienza
+- fallback path in assenza capability hardware
+
+====================================================================
+17) REGOLE DI CONFORMITA PER NUOVE SCHEDE (BASELINE REUSE)
+====================================================================
+Queste regole sono obbligatorie se si usa NI9234 come baseline per nuovi moduli.
+
+17.1 Da mantenere invariato
+- Contratto sync con root (env + handlers + snapshot)
+- Pattern start/save/stop/merge
+- Workspace schema e logica per-device
+- Engine canali calcolati + editor formule
+- Pipeline TDMS metadata coerenti waveform
+- Chiusura robusta thread/timer/socket
+
+17.2 Da parametrare per nuova scheda
+- Tipo canali fisici (ai/di/counter)
+- Numero canali e naming
+- Limiti Fs per-channel/aggregati
+- Config colonne tabella e opzioni hardware specifiche
+- Config NI-DAQmx task (AI/DI/CI, trigger, clock)
+- Metadata specifici di dominio
+
+====================================================================
+18) DELTA ANALYSIS INIZIALE PER NI9229 (USO BASELINE NI9234)
+====================================================================
+Nota: questo paragrafo e orientativo per pianificazione tecnica; i valori finali vanno validati contro specifica ufficiale NI e capability runtime via nidaqmx.
+
+18.1 Vicinanza architetturale
+NI9229 e piu vicino a NI9234 rispetto a moduli digitali/counter, perche:
+- entrambi moduli analogici
+- stessa famiglia di flusso: AI waveform, Fs per-canale, TDMS waveform
+- riuso alto di UI, plot, merge, calcoli, sync orchestration
+
+18.2 Differenze attese principali (da implementare)
+- Front-end analogico differente (range, filtri, eventuale coupling supportato)
+- Parametri min/max input e unita di default
+- Capability rate reali e clamp da device caps
+- Eventuali proprieta DAQmx non supportate su NI9229 (es. IEPE)
+
+18.3 Strategia consigliata
+- Fork logico NI9234 -> NI9229
+- Conservare tutta la scaffolding orchestration/workspace/merge/formule
+- Isolare differenze in:
+  - acquisition.py: add channel config + timing/caps specifici
+  - ui.py: colonne e default pertinenti alla scheda
+  - gestione_risorse.py: naming canali se diverso
+
+====================================================================
+19) PIANO MULTITASK (PROJECT LEAD VIEW)
+====================================================================
+19.1 Workstream A - Core Acquisition
+Owner: Team Core I/O
+- Porting task creation NI9229
+- Caps/rate clamp corretti
+- Verifica callback chunk e buffer sizing
+- Zeroing semantica invariata
+
+DoD:
+- start/stop/stop_graceful stabili
+- no data drop in condizioni nominali
+- status snapshot coerente
+
+19.2 Workstream B - UI/UX parity
+Owner: Team UI
+- Copia conforme comportamento NI9234
+- Aggiornamento colonne specifiche hardware
+- lock/unlock remoto invariato
+- error popups uniformi
+
+DoD:
+- Nessuna regressione su workspace e tab calcolati
+- Nessuna anomalia visuale o testo corrotto
+
+19.3 Workstream C - Sync & orchestration
+Owner: Team Sync
+- Validazione tutti handler
+- START_SYNC hardware/software parity
+- sample-clock shared dove applicabile
+- cutoff gating N0 testato con root
+
+DoD:
+- Sessione sync multi-modulo passata
+- stop_and_merge remoto affidabile
+
+19.4 Workstream D - Data persistence
+Owner: Team Storage
+- Metadata TDMS completi
+- Merge con validazione attiva
+- FFT append opzionale (se feature presente)
+
+DoD:
+- File finale validato
+- Proprieta canali preservate
+
+19.5 Workstream E - Formula engine integration
+Owner: Team Analytics
+- Parser aiX/ccX/Fs compatibile nuova scheda
+- Esempi formula aggiornati se naming cambia
+
+DoD:
+- compile/evaluate senza regressioni
+- runtime errors confinati al canale
+
+====================================================================
+20) CHECKLIST TEST MANUALI OBBLIGATORI
+====================================================================
+20.1 Standalone
+- Avvio da main.py con startup UI
+- Device detection reale/simulato
+- Abilitazione/disabilitazione canali
+- Cambio Fs con restart corretto
+
+20.2 Root orchestration
+- Avvio con env CDAQ_SYNC_* validi
+- STATUS_SNAPSHOT corretto
+- APPLY_CHASSIS_CONFIG applica fs/path/file/ram
+- lock UI remoto e unlock finale
+
+20.3 Sync
+- ARM_ACQUISITION + START_SYNC software
+- START_SYNC hardware slave con trigger
+- sample_clock shared (se supportato) e fallback locale
+- SET_SYNC_WRITE_CUTOFF applicato correttamente
+
+20.4 Salvataggio/merge
+- START_SAVE
+- crescita contatore memoria su pulsante
+- STOP_AND_MERGE produce TDMS finale
+- validazione merge passata
+- cartella segmenti temporanei rimossa
+
+20.5 Zeroing
+- Azzeramento fisico: valore azzerato aggiornato
+- valore istantaneo live shiftato rispetto baseline
+- persistenza zero in workspace
+
+20.6 Canali calcolati
+- compile formula expression e def ccX
+- errori formula non bloccano acquisizione
+- zero canali calcolati coerente
+- plotting ccX opzionale funziona
+
+20.7 FFT
+- Abilitazione FFT live
+- plot aggiornato + peak info
+- stop salva segmento FFT quando disponibile
+
+20.8 Robustezza
+- Chiusura finestra senza crash
+- Nessun thread pendente
+- Nessun socket sync zombie
+
+====================================================================
+21) RISCHI NOTI / TECH DEBT DA MONITORARE
+====================================================================
+- Presenza di stringhe con encoding degradato in alcuni commenti/testi: mantenere file UTF-8 puliti nelle nuove estensioni.
+- Queue attualmente unbounded in acquisizione: utile monitorare memoria in scenari limite I/O lento.
+- Fallback silenziosi multipli: introdurre logging strutturato puo migliorare diagnosi.
+- Dipendenze opzionali scipy/pandas: garantire comportamento coerente quando assenti.
+
+====================================================================
+22) CRITERI DI ACCETTAZIONE BASELINE (GATE)
+====================================================================
+Una nuova scheda puo essere dichiarata "baseline-conforme" solo se:
+1. Passa tutti i test della sezione 20 senza regressioni critiche.
+2. Mantiene invariati i contratti sync (handlers, payload, snapshot).
+3. Mantiene compatibilita workspace e formula engine.
+4. Produce TDMS merge validato con metadata waveform coerenti.
+5. Garantisce chiusura pulita risorse anche su error path.
+
+====================================================================
+23) APPENDICE - MAPPATURA RAPIDA METODI CHIAVE
+====================================================================
+UI (ui.py)
+- _build_ui
+- _load_config / _save_config
+- refresh_devices
+- _populate_table
+- _populate_type_column
+- _recompute_all_calibrations
+- _update_acquisition_from_table
+- _on_rate_edit_finished
+- _on_start_saving
+- _on_stop
+- _save_workspace / _load_workspace
+- _on_zero_button_clicked
+- _init_sync_agent + _sync_cmd_*
+- closeEvent
+
+Core (acquisition.py)
+- set_user_rate_hz
+- set_sensor_map
+- set_calculated_channels
+- start / stop / stop_graceful
+- _on_every_n_samples
+- _writer_loop
+- set_sync_anchor_epoch_s
+- set_sync_write_start_index
+- set_zero_raw / clear_zero / get_last_raw / get_last_engineered
+
+Merge (tdms_merge.py)
+- merge_temp_tdms
+- _validate_merged_file
+
+Risorse (gestione_risorse.py)
+- ResourceManagerDialog
+- _apply_save
+- _load_selected_sensor
+
+Formula engine (calculated_channels_engine.py)
+- configure
+- set_enabled_channels
+- evaluate
+
+====================================================================
+FINE BASELINE
+====================================================================
