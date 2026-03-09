@@ -397,7 +397,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # Finestra per il modulo NI-9234.  In questo progetto non ? prevista
         # la selezione di altri modelli di scheda.
-        self.setWindowTitle("NI 9234 Acquisition - Demo Architettura")
+        self.setWindowTitle("NI 9234 Acquisition - Architettura")
         self.resize(1200, 740)
 
         # stati UI/logica
