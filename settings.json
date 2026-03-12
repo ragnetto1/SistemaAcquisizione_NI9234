@@ -1,6 +1,5 @@
 {
-  "save_dir": "C:\\UG-WORK\\SistemaAcquisizione_CDAQ\\SenzaNome2_11-03-2026_09-10-23\\NI9234_cDAQ1Mod4",
-  "base_filename": "SenzaNome2.tdms",
-  "ram_mb": 12,
-  "fs": 100.0
+  "save_dir": "C:\\UG-WORK\\SistemaAcquisizione_CDAQ\\Desync_12-03-2026_10-32-30\\NI9234_cDAQ2Mod3",
+  "base_filename": "Desync.tdms",
+  "ram_mb": 12
 }
