@@ -1,6 +1,6 @@
 {
-  "save_dir": "C:\\UG-WORK\\SistemaAcquisizione_CDAQ\\Desync_12-03-2026_10-32-30\\NI9234_cDAQ2Mod3",
-  "base_filename": "Desync.tdms",
+  "save_dir": "C:\\UG-WORK\\SistemaAcquisizione_CDAQ\\SoackTest1h_13-03-2026_15-00-07\\NI9234_cDAQ2Mod3",
+  "base_filename": "SoackTest1h.tdms",
   "ram_mb": 12,
   "show_phys_plot": false,
   "show_calc_plot": false,
@@ -9,5 +9,6 @@
   "chart_window_s": 0.0,
   "chart_robust_y": true,
   "chart_lock_y": false,
-  "chart_cursors": false
+  "chart_cursors": false,
+  "fs": 12500.0
 }
