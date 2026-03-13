@@ -1,4 +1,4 @@
-﻿# Data/Ora: 2026-02-12 20:38:51
+# Data/Ora: 2026-02-12 20:38:51
 # ui.py
 from PyQt5 import QtCore, QtWidgets, QtGui
 import sys
@@ -15,6 +15,7 @@ import json
 import glob
 import importlib.util
 import time
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeout
 from typing import List, Callable, Optional, Dict, Any, Tuple
 
 from calculated_channels_engine import CalculatedChannelsEngine
@@ -83,6 +84,77 @@ XML_V2V = "Valore2Volt"
 XML_V2  = "Valore2"
 
 
+
+
+def _fft_compute_window_npz(npz_path: str, phys_order: Tuple[str, ...], fs_hint: float) -> Tuple[object, object, str]:
+    try:
+        with np.load(npz_path, allow_pickle=False) as z:
+            t_all = np.asarray(z.get("t", []), dtype=np.float64)
+            if t_all.size < 64:
+                return None, {}, ""
+            fs = float(fs_hint or 0.0)
+            if fs <= 0.0:
+                try:
+                    dt = np.diff(t_all)
+                    dt = dt[np.isfinite(dt) & (dt > 0.0)]
+                    if dt.size > 0:
+                        fs = 1.0 / float(np.median(dt))
+                except Exception:
+                    fs = 0.0
+            if fs <= 0.0 or (not np.isfinite(fs)):
+                return None, {}, ""
+
+            freq_ref = None
+            mag_map: Dict[str, np.ndarray] = {}
+            peaks = []
+
+            for phys in list(phys_order or ()):
+                key = f"y_{phys}"
+                if key not in z:
+                    continue
+                y = np.asarray(z.get(key), dtype=np.float64)
+                if y.size != t_all.size or y.size < 64:
+                    continue
+                if not np.all(np.isfinite(y)):
+                    v = np.isfinite(y)
+                    if np.count_nonzero(v) < 64:
+                        continue
+                    y = np.interp(t_all, t_all[v], y[v])
+
+                n = int(y.size)
+                nfft = 1 << int(np.floor(np.log2(max(64, n))))
+                if nfft < 64:
+                    continue
+                seg = np.asarray(y[-nfft:], dtype=np.float64, copy=False)
+                seg = seg - float(np.mean(seg))
+                win = np.hanning(nfft).astype(np.float64, copy=False)
+                w_sum = float(np.sum(win))
+                if w_sum <= 0.0:
+                    continue
+                spec = np.fft.rfft(seg * win)
+                mag = (2.0 / w_sum) * np.abs(spec)
+                freq = np.fft.rfftfreq(nfft, d=1.0 / fs)
+
+                if not (isinstance(freq, np.ndarray) and isinstance(mag, np.ndarray)):
+                    continue
+                if freq_ref is None:
+                    freq_ref = np.asarray(freq, dtype=np.float32)
+                if freq_ref is None or mag.size != freq_ref.size:
+                    continue
+                mag_f32 = np.asarray(mag, dtype=np.float32)
+                mag_map[str(phys)] = mag_f32
+                if mag_f32.size > 1:
+                    i = int(np.argmax(mag_f32[1:])) + 1
+                    peaks.append((str(phys), float(mag_f32[i]), float(freq_ref[i])))
+
+            if not isinstance(freq_ref, np.ndarray) or not mag_map:
+                return None, {}, ""
+            peak_text = "; ".join([f"{p}: {a:.3g} @ {f:.6g} Hz" for p, a, f in peaks])
+            return freq_ref, mag_map, peak_text
+    except Exception:
+        return None, {}, ""
+
+
 class FFTDiskWorker(QtCore.QObject):
     sigStatus = QtCore.pyqtSignal(str)
     sigResult = QtCore.pyqtSignal(object, object, object)   # (freq, mag_by_phys, peak_text)
@@ -103,6 +175,64 @@ class FFTDiskWorker(QtCore.QObject):
         self._window_y_paths: Dict[str, str] = {}
         self._temp_npz_files: List[str] = []
         self._temp_keep_count = 3
+        env_isolation = str(os.environ.get("CDAQ_FFT_ISOLATE", "1") or "1").strip().lower()
+        self._proc_isolation_enabled = env_isolation not in ("0", "false", "no", "off")
+        self._proc_timeout_s = 25.0
+        self._proc_pool = None
+        if self._proc_isolation_enabled:
+            try:
+                self._proc_pool = ProcessPoolExecutor(max_workers=1)
+            except Exception:
+                self._proc_pool = None
+
+
+    def _shutdown_proc_pool(self) -> None:
+        pool = getattr(self, "_proc_pool", None)
+        self._proc_pool = None
+        if pool is None:
+            return
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+    def __del__(self):
+        try:
+            self._shutdown_proc_pool()
+        except Exception:
+            pass
+
+    def _compute_fft_from_npz_isolated(self, npz_path: str, fs_hint: float) -> Tuple[Optional[np.ndarray], Dict[str, np.ndarray], str]:
+        if bool(getattr(self, "_proc_isolation_enabled", True)) and getattr(self, "_proc_pool", None) is not None:
+            try:
+                fut = self._proc_pool.submit(_fft_compute_window_npz, str(npz_path), tuple(self._phys_order), float(fs_hint))
+                freq_obj, mag_obj, peak_text = fut.result(timeout=float(getattr(self, "_proc_timeout_s", 25.0) or 25.0))
+                if not isinstance(freq_obj, np.ndarray):
+                    return None, {}, ""
+                freq = np.asarray(freq_obj, dtype=np.float32)
+                out: Dict[str, np.ndarray] = {}
+                if isinstance(mag_obj, dict):
+                    for k, v in mag_obj.items():
+                        arr = np.asarray(v, dtype=np.float32)
+                        if arr.size == freq.size:
+                            out[str(k)] = arr
+                if not out:
+                    return None, {}, ""
+                return freq, out, str(peak_text or "")
+            except FutureTimeout:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            freq_obj, mag_obj, peak_text = _fft_compute_window_npz(str(npz_path), tuple(self._phys_order), float(fs_hint))
+            if isinstance(freq_obj, np.ndarray) and isinstance(mag_obj, dict) and mag_obj:
+                return np.asarray(freq_obj, dtype=np.float32), {str(k): np.asarray(v, dtype=np.float32) for k, v in mag_obj.items()}, str(peak_text or "")
+        except Exception:
+            pass
+        return None, {}, ""
 
     def _get_chunk_dir(self) -> str:
         base = self._save_dir or DEFAULT_SAVE_DIR
@@ -349,36 +479,97 @@ class FFTDiskWorker(QtCore.QObject):
             self._window_idx += 1
             return
 
-        freq_ref = None
-        mag_map: Dict[str, np.ndarray] = {}
-        peaks = []
-        for phys in self._phys_order:
-            y = np.asarray(y_all.get(phys, []), dtype=np.float64)
-            if y.size != t_all.size or y.size < 64:
-                continue
-            if not np.all(np.isfinite(y)):
-                v = np.isfinite(y)
-                if np.count_nonzero(v) < 64:
-                    continue
-                y = np.interp(t_all, t_all[v], y[v])
-            freq, mag = self._compute_fft_mag(y, fs)
-            if not (isinstance(freq, np.ndarray) and isinstance(mag, np.ndarray)):
-                continue
-            if freq_ref is None:
-                freq_ref = freq
-            if freq_ref is None or mag.size != freq_ref.size:
-                continue
-            mag_map[phys] = mag
-            if mag.size > 1:
-                i = int(np.argmax(mag[1:])) + 1
-                peaks.append((phys, float(mag[i]), float(freq_ref[i])))
-
-        peak_text = "; ".join([f"{p}: {a:.3g} @ {f:.6g} Hz" for p, a, f in peaks])
+        del y_all
+        freq_ref, mag_map, peak_text = self._compute_fft_from_npz_isolated(final_npz, fs)
         if isinstance(freq_ref, np.ndarray) and mag_map:
             self.sigResult.emit(freq_ref, mag_map, peak_text)
 
         self.reset(True, False)
         self._window_idx += 1
+
+
+class FloatRingBuffer:
+    """Fixed-size float32 ring buffer for UI preview plotting."""
+
+    __slots__ = ("capacity", "_data", "_start", "_size")
+
+    def __init__(self, capacity: int, dtype=np.float32):
+        cap = int(capacity or 0)
+        if cap <= 0:
+            cap = 1
+        self.capacity = cap
+        self._data = np.empty(cap, dtype=dtype)
+        self._start = 0
+        self._size = 0
+
+    def __len__(self) -> int:
+        return int(self._size)
+
+    def clear(self) -> None:
+        self._start = 0
+        self._size = 0
+
+    def append(self, value) -> None:
+        self.extend([value])
+
+    def extend(self, values) -> None:
+        arr = np.asarray(values, dtype=self._data.dtype).reshape(-1)
+        n = int(arr.size)
+        if n <= 0:
+            return
+        cap = int(self.capacity)
+        if n >= cap:
+            self._data[:] = arr[-cap:]
+            self._start = 0
+            self._size = cap
+            return
+        size = int(self._size)
+        start = int(self._start)
+        end = (start + size) % cap
+        first = min(n, cap - end)
+        self._data[end:end + first] = arr[:first]
+        rest = n - first
+        if rest > 0:
+            self._data[0:rest] = arr[first:first + rest]
+        new_size = size + n
+        if new_size <= cap:
+            self._size = new_size
+            return
+        overflow = new_size - cap
+        self._size = cap
+        self._start = (start + overflow) % cap
+
+    def to_numpy(self, dtype=np.float64) -> np.ndarray:
+        size = int(self._size)
+        if size <= 0:
+            return np.array([], dtype=dtype)
+        cap = int(self.capacity)
+        start = int(self._start)
+        if start + size <= cap:
+            out = self._data[start:start + size]
+        else:
+            first = self._data[start:cap]
+            second = self._data[0:(start + size) % cap]
+            out = np.concatenate((first, second), axis=0)
+        return np.asarray(out, dtype=dtype)
+
+    def resize(self, new_capacity: int) -> None:
+        cap = int(new_capacity or 0)
+        if cap <= 0:
+            cap = 1
+        if cap == int(self.capacity):
+            return
+        old = self.to_numpy(dtype=self._data.dtype)
+        if old.size > cap:
+            old = old[-cap:]
+        self.capacity = cap
+        self._data = np.empty(cap, dtype=self._data.dtype)
+        self._start = 0
+        self._size = 0
+        n = int(old.size)
+        if n > 0:
+            self._data[:n] = old
+            self._size = n
 
 
 class AcquisitionWindow(QtWidgets.QMainWindow):
@@ -421,17 +612,26 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # grafici: buffer
         MAXPTS = 12000
-        self._chart_x = deque(maxlen=MAXPTS)
+        self._chart_x = FloatRingBuffer(MAXPTS, dtype=np.float64)
+        self._chart_history_points = MAXPTS
         # Buffer e curve grafici per ciascun canale
-        self._chart_y_by_phys = {f"ai{i}": deque(maxlen=MAXPTS) for i in range(num_chans)}
+        self._chart_y_by_phys = {f"ai{i}": FloatRingBuffer(MAXPTS) for i in range(num_chans)}
         self._instant_t = np.array([], dtype=float)
         self._instant_y_by_phys = {f"ai{i}": np.array([], dtype=float) for i in range(num_chans)}
         self._chart_curves_by_phys = {}
         self._instant_curves_by_phys = {}
-        self._chart_y_by_calc: Dict[str, deque] = {}
+        self._chart_y_by_calc: Dict[str, FloatRingBuffer] = {}
         self._instant_y_by_calc: Dict[str, np.ndarray] = {}
         self._chart_curves_by_calc: Dict[str, Any] = {}
         self._instant_curves_by_calc: Dict[str, Any] = {}
+        self._curve_pool_chart_phys: List[Any] = []
+        self._curve_pool_instant_phys: List[Any] = []
+        self._curve_pool_chart_calc: List[Any] = []
+        self._curve_pool_instant_calc: List[Any] = []
+        self._curve_pool_max = 48
+        self._curve_pool_max_total = 96
+        self._suspend_preview_when_background = True
+        self._compact_instant_when_background = True
         self._calc_last_value_raw: Dict[str, float] = {}
         self._calc_zero_by_cc: Dict[str, Optional[float]] = {}
         self._calc_formula_by_cc: Dict[str, str] = {}
@@ -529,7 +729,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # UI
         self._build_ui()
-        self._init_fft_worker()
+        self._fft_thread = None
+        self._fft_worker = None
         self._connect_signals()
         self._populate_calc_table(reset=True)
         self._rebuild_calc_engine(update_core=True)
@@ -548,6 +749,15 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
         # Avvia l'agent solo in modalita chassis-control.
         self._init_sync_agent()
+
+    def _ensure_fft_worker(self):
+        try:
+            thr = getattr(self, "_fft_thread", None)
+            if thr is not None and thr.isRunning():
+                return
+        except Exception:
+            pass
+        self._init_fft_worker()
 
     def _init_fft_worker(self):
         self._fft_thread = QtCore.QThread(self)
@@ -654,6 +864,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.tabChart = QtWidgets.QWidget()
         vchart = QtWidgets.QVBoxLayout(self.tabChart)
         self.pgChart = pg.PlotWidget(title="Chart concatenato (decimato)")
+        try:
+            self.pgChart.showGrid(x=True, y=True, alpha=0.12)
+        except Exception:
+            pass
         self._chart_legend = pg.LegendItem()
         self._chart_legend.setParentItem(self.pgChart.getPlotItem().graphicsItem())
         self._chart_legend.anchor((0, 1), (0, 1), offset=(10, -10))
@@ -671,12 +885,86 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         vchart.addWidget(self.lblAvgChart)
         hctrl = QtWidgets.QHBoxLayout()
         self.btnClearChart = QtWidgets.QPushButton("Pulizia grafico")
-        self.chkCalcViewEnable = QtWidgets.QCheckBox("Abilita visualizzazione canali calcolati")
+        self.chkPhysViewEnable = QtWidgets.QPushButton("Abilita visualizzazione canali")
+        self.chkPhysViewEnable.setCheckable(True)
+        self.chkPhysViewEnable.setChecked(False)
+        self.chkCalcViewEnable = QtWidgets.QPushButton("Abilita visualizzazione canali calcolati")
+        self.chkCalcViewEnable.setCheckable(True)
         self.chkCalcViewEnable.setChecked(False)
+        self.cmbChartPreset = QtWidgets.QComboBox()
+        self.cmbChartPreset.addItems(["Operativo", "Diagnostica", "Prestazioni"])
+        self.cmbChartMode = QtWidgets.QComboBox()
+        self.cmbChartMode.addItem("Overlay", "overlay")
+        self.cmbChartMode.addItem("Offset", "offset")
+        self.cmbChartMode.addItem("Stacked", "stacked")
+        self.chkChartRelativeTime = QtWidgets.QPushButton("Tempo relativo")
+        self.chkChartRelativeTime.setCheckable(True)
+        self.chkChartRelativeTime.setChecked(True)
+        self.spinChartWindowSec = QtWidgets.QDoubleSpinBox()
+        self.spinChartWindowSec.setDecimals(1)
+        self.spinChartWindowSec.setRange(0.0, 86400.0)
+        self.spinChartWindowSec.setSingleStep(5.0)
+        self.spinChartWindowSec.setValue(60.0)
+        self.spinChartWindowSec.setSuffix(" s")
+        self.chkChartRobustY = QtWidgets.QCheckBox("Autoscale")
+        self.chkChartRobustY.setChecked(True)
+        self.chkChartLockY = QtWidgets.QCheckBox("Blocca Y")
+        self.chkChartRobustY.setVisible(False)
+        self.chkChartLockY.setVisible(False)
+        self.cmbChartYScale = QtWidgets.QComboBox()
+        self.cmbChartYScale.addItem("Autoscale", "autoscale")
+        self.cmbChartYScale.addItem("Blocca Y", "lock")
+        self.lblChartYMin = QtWidgets.QLabel("Y min:")
+        self.spinChartYMin = QtWidgets.QDoubleSpinBox()
+        self.spinChartYMin.setDecimals(1)
+        self.spinChartYMin.setRange(-1.0e12, 1.0e12)
+        self.spinChartYMin.setSingleStep(0.1)
+        self.spinChartYMin.setFixedWidth(88)
+        self.spinChartYMin.setValue(-1.0)
+        self.lblChartYMax = QtWidgets.QLabel("Y max:")
+        self.spinChartYMax = QtWidgets.QDoubleSpinBox()
+        self.spinChartYMax.setDecimals(1)
+        self.spinChartYMax.setRange(-1.0e12, 1.0e12)
+        self.spinChartYMax.setSingleStep(0.1)
+        self.spinChartYMax.setFixedWidth(88)
+        self.spinChartYMax.setValue(1.0)
+        self.lblChartYMin.setVisible(False)
+        self.spinChartYMin.setVisible(False)
+        self.lblChartYMax.setVisible(False)
+        self.spinChartYMax.setVisible(False)
+        self.cmbChartFocus = QtWidgets.QComboBox()
+        self.cmbChartFocus.addItem("Tutti", "")
+        self.chkChartCursors = QtWidgets.QCheckBox("Cursori A/B")
+        self.chkChartCursors.setVisible(False)
+        self.chkChartCursors.setChecked(False)
+        self.btnChartFit = QtWidgets.QPushButton("Fit vista")
+        self.btnChartFit.setVisible(False)
+        self.btnChartResetView = QtWidgets.QPushButton("Reset vista")
+
+        hctrl.addWidget(self.chkPhysViewEnable)
         hctrl.addWidget(self.chkCalcViewEnable)
+        hctrl.addSpacing(8)
+        self.cmbChartPreset.setVisible(False)
+        self.cmbChartMode.setVisible(False)
+        hctrl.addWidget(QtWidgets.QLabel("Focus:"))
+        hctrl.addWidget(self.cmbChartFocus)
+        hctrl.addWidget(self.chkChartRelativeTime)
+        hctrl.addWidget(QtWidgets.QLabel("Finestra:"))
+        hctrl.addWidget(self.spinChartWindowSec)
+        hctrl.addWidget(QtWidgets.QLabel("Scala Y:"))
+        hctrl.addWidget(self.cmbChartYScale)
+        hctrl.addWidget(self.lblChartYMin)
+        hctrl.addWidget(self.spinChartYMin)
+        hctrl.addWidget(self.lblChartYMax)
+        hctrl.addWidget(self.spinChartYMax)
         hctrl.addStretch(1)
+        hctrl.addWidget(self.btnChartResetView)
         hctrl.addWidget(self.btnClearChart)
         vchart.addLayout(hctrl)
+        self.lblChartCursorInfo = QtWidgets.QLabel("")
+        self.lblChartCursorInfo.setWordWrap(True)
+        self.lblChartCursorInfo.setVisible(False)
+        vchart.addWidget(self.lblChartCursorInfo)
         tabPlots.addTab(self.tabChart, "Chart concatenato")
 
         self.tabInstant = QtWidgets.QWidget()
@@ -788,6 +1076,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         tabPlots.addTab(self.tabFFT, "FFT")
 
         self.tabs.addTab(tabPlots, "Grafici")
+        self._plots_tab_widget = tabPlots
+        self._plots_tab_index = self.tabs.indexOf(tabPlots)
 
         # Barra salvataggio in basso
         bottom = QtWidgets.QHBoxLayout()
@@ -834,6 +1124,96 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.guiTimer = QtCore.QTimer(self)
         self.guiTimer.setInterval(100)
         self.guiTimer.timeout.connect(self._refresh_plots)
+        self._calc_curve_layout_dirty = True
+        self._plot_render_max_points = 2500
+        self._preview_points_per_block = 1200
+        self._preview_minmax_enabled = True
+        self._preview_queue_max_blocks = 24
+        self._preview_queue = deque(maxlen=self._preview_queue_max_blocks)
+        self._preview_queue_dropped = 0
+        self._preview_apply_blocks_per_tick = 3
+        self._preview_apply_blocks_per_tick_default = 3
+        self._render_budget_curves = 8
+        self._render_budget_curves_default = 8
+        self._render_budget_curves_instant = 8
+        self._render_budget_curves_instant_default = 8
+        self._rr_cursor_chart = 0
+        self._rr_cursor_instant = 0
+        self._plot_render_max_points_default = int(self._plot_render_max_points)
+        self._guardrail_active = False
+        self._refresh_ewma_ms = 0.0
+        self._guardrail_high_ms = 35.0
+        self._guardrail_low_ms = 18.0
+        self._guardrail_min_render_points = 700
+        self._plot_sample_idx_cache: Dict[Tuple[int, int], np.ndarray] = {}
+        self._plot_sample_idx_cache_limit = 32
+        self._history_budget_points = 220000
+        self._history_min_points = 1200
+        self._history_max_points = 12000
+        self._history_adjust_cooldown_s = 1.2
+        self._last_history_adjust_ts = 0.0
+        self._preview_idx_scratch = np.empty(max(256, int(self._preview_points_per_block) * 2 + 4), dtype=np.int64)
+        self._table_value_min_interval_s = 0.12
+        self._last_table_flush_ts = 0.0
+        self._pending_table_updates: Dict[str, Any] = {}
+        self._chart_last_preview_t = np.nan
+        self._chart_gap_between_blocks = True
+        self._chart_last_series_by_key: Dict[str, Tuple[np.ndarray, np.ndarray, str]] = {}
+        self._chart_locked_ylim: Optional[Tuple[float, float]] = None
+        self._chart_preset_active = ""
+        self._chart_cursor_a = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen((255, 255, 255, 140), width=1.0))
+        self._chart_cursor_b = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen((255, 200, 0, 140), width=1.0))
+        try:
+            self.pgChart.addItem(self._chart_cursor_a, ignoreBounds=True)
+            self.pgChart.addItem(self._chart_cursor_b, ignoreBounds=True)
+            self._chart_cursor_a.hide()
+            self._chart_cursor_b.hide()
+        except Exception:
+            pass
+        self._table_flush_timer = QtCore.QTimer(self)
+        self._table_flush_timer.setInterval(100)
+        self._table_flush_timer.timeout.connect(self._flush_table_value_updates)
+        self._table_flush_timer.start()
+
+        self._avg_ui_interval_s = 0.15
+        self._last_avg_ui_update_ts = 0.0
+
+        self._legend_signature_cache: Optional[Tuple[Any, ...]] = None
+        self._chart_focus_signature_cache: Optional[Tuple[Any, ...]] = None
+
+        self._guardrail_rss_high_mb = 900.0
+        self._guardrail_rss_low_mb = 720.0
+
+        self._ui_profile_background = False
+        self._bg_gui_interval = max(250, int(self._default_gui_interval * 3))
+        self._bg_render_budget_curves = 2
+        self._bg_render_budget_curves_instant = 2
+        self._bg_preview_apply_blocks = 1
+        self._ui_profile_timer = QtCore.QTimer(self)
+        self._ui_profile_timer.setInterval(1000)
+        self._ui_profile_timer.timeout.connect(self._update_ui_render_profile)
+        self._ui_profile_timer.start()
+
+        profile_name = str(os.environ.get("CDAQ_UI_PROFILE", "balanced") or "balanced").strip().lower()
+        if profile_name in ("high", "high_load", "low_memory"):
+            self._plot_render_max_points_default = min(int(self._plot_render_max_points_default), 1800)
+            self._plot_render_max_points = min(int(self._plot_render_max_points), 1800)
+            self._render_budget_curves_default = min(int(self._render_budget_curves_default), 6)
+            self._render_budget_curves = min(int(self._render_budget_curves), 6)
+            self._render_budget_curves_instant_default = min(int(self._render_budget_curves_instant_default), 5)
+            self._render_budget_curves_instant = min(int(self._render_budget_curves_instant), 5)
+            self._preview_apply_blocks_per_tick_default = min(int(self._preview_apply_blocks_per_tick_default), 2)
+            self._preview_apply_blocks_per_tick = min(int(self._preview_apply_blocks_per_tick), 2)
+            self._bg_gui_interval = max(self._bg_gui_interval, 350)
+
+        self._perf_metrics = deque(maxlen=720)
+        self._perf_logging_enabled = True
+        self._perf_log_path = os.path.join(os.path.dirname(__file__), "runtime_perf.csv")
+        self._perf_timer = QtCore.QTimer(self)
+        self._perf_timer.setInterval(2000)
+        self._perf_timer.timeout.connect(self._sample_performance_metrics)
+        self._perf_timer.start()
+
 
         # Relayout throttled per widget embedded nelle celle (bottoni/combo/spinbox).
         self._cell_widget_relayout_timer = QtCore.QTimer(self)
@@ -893,6 +1273,24 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 self.rateEdit.setText(str(fs))
         except Exception:
             pass
+        try:
+            self.chkPhysViewEnable.setChecked(False)
+        except Exception:
+            pass
+        try:
+            self.chkCalcViewEnable.setChecked(False)
+        except Exception:
+            pass
+        try:
+            self.cmbChartPreset.setCurrentText(str(cfg.get("chart_preset", "Operativo") or "Operativo"))
+            self.cmbChartMode.setCurrentText(str(cfg.get("chart_mode", "Overlay") or "Overlay"))
+            self.chkChartRelativeTime.setChecked(True)
+            self.spinChartWindowSec.setValue(float(cfg.get("chart_window_s", 60.0) or 0.0))
+            self.chkChartRobustY.setChecked(bool(cfg.get("chart_robust_y", True)))
+            self.chkChartLockY.setChecked(bool(cfg.get("chart_lock_y", False)))
+            self.chkChartCursors.setChecked(bool(cfg.get("chart_cursors", False)))
+        except Exception:
+            pass
 
     def _save_config(self):
         """
@@ -912,6 +1310,14 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             pass
         try:
             cfg["ram_mb"] = int(self.spinRam.value())
+            cfg["show_phys_plot"] = bool(self.chkPhysViewEnable.isChecked())
+            cfg["show_calc_plot"] = bool(self.chkCalcViewEnable.isChecked())
+            cfg["chart_preset"] = str(self.cmbChartPreset.currentText() or "Operativo")
+            cfg["chart_mode"] = str(self.cmbChartMode.currentText() or "Overlay")
+            cfg["chart_window_s"] = float(self.spinChartWindowSec.value())
+            cfg["chart_robust_y"] = bool(self.chkChartRobustY.isChecked())
+            cfg["chart_lock_y"] = bool(self.chkChartLockY.isChecked())
+            cfg["chart_cursors"] = bool(self.chkChartCursors.isChecked())
         except Exception:
             pass
         try:
@@ -983,6 +1389,22 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.btnAddCalcChannel.clicked.connect(self._on_add_calc_channel)
         self.btnResetCalc.clicked.connect(self._on_reset_calculated_channels)
         self.chkCalcViewEnable.toggled.connect(self._on_calc_view_toggled)
+        self.chkPhysViewEnable.toggled.connect(self._on_phys_view_toggled)
+        try:
+            self.cmbChartFocus.currentIndexChanged.connect(self._on_chart_focus_changed)
+            self.chkChartRelativeTime.toggled.connect(self._on_chart_view_option_changed)
+            self.chkChartRelativeTime.toggled.connect(self._update_chart_relative_button_style)
+            self.spinChartWindowSec.valueChanged.connect(self._on_chart_view_option_changed)
+            self.cmbChartYScale.currentIndexChanged.connect(self._on_chart_y_scale_changed)
+            self.spinChartYMin.valueChanged.connect(self._on_chart_y_limits_changed)
+            self.spinChartYMax.valueChanged.connect(self._on_chart_y_limits_changed)
+            self.btnChartResetView.clicked.connect(self._on_chart_reset_view_clicked)
+        except Exception:
+            pass
+        self._apply_chart_preset("Operativo", force=True)
+        self._update_chart_relative_button_style()
+        self._update_chart_view_buttons_style()
+        self._on_chart_y_scale_changed(show_popup=False)
 
         # collegamenti per salvataggio/caricamento workspace
         try:
@@ -1018,7 +1440,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             pass
 
         # callback dal core (rimappati in segnali Qt)
-        self.channelValueUpdated.connect(self._update_table_value)
+        self.channelValueUpdated.connect(self._queue_table_value_update)
         self.sigInstantBlock.connect(self._slot_instant_block)
         self.sigChartPoints.connect(self._slot_chart_points)
 
@@ -1459,7 +1881,943 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             pass
 
     def _on_calc_view_toggled(self, _checked: bool) -> None:
+        self._update_chart_view_buttons_style()
+        self._calc_curve_layout_dirty = True
         self._sync_calc_plot_curves()
+        self._trim_plot_history_buffers()
+
+    def _on_phys_view_toggled(self, _checked: bool) -> None:
+        self._update_chart_view_buttons_style()
+        self._calc_curve_layout_dirty = True
+        self._ensure_phys_plot_curves(
+            show_phys=bool(self.chkPhysViewEnable.isChecked()),
+            instant_enabled=bool(getattr(self, '_instant_plot_enabled', True)),
+        )
+        self._trim_plot_history_buffers()
+
+
+    def _on_instant_view_toggled(self, checked: bool) -> None:
+        self._instant_plot_enabled = bool(checked)
+        self._calc_curve_layout_dirty = True
+        self._ensure_phys_plot_curves(
+            show_phys=bool(self.chkPhysViewEnable.isChecked()),
+            instant_enabled=bool(self._instant_plot_enabled),
+        )
+        self._sync_calc_plot_curves()
+        if not self._instant_plot_enabled:
+            for curve in list(getattr(self, '_instant_curves_by_phys', {}).values()):
+                try:
+                    curve.clear()
+                except Exception:
+                    pass
+            for curve in list(getattr(self, '_instant_curves_by_calc', {}).values()):
+                try:
+                    curve.clear()
+                except Exception:
+                    pass
+        self._trim_plot_history_buffers()
+
+    def _trim_plot_history_buffers(self) -> None:
+        show_phys = bool(self.chkPhysViewEnable.isChecked())
+        show_calc = bool(self.chkCalcViewEnable.isChecked())
+
+        if not show_phys:
+            for phys in list(self._chart_curves_by_phys.keys()):
+                self._release_curve_to_pool('_curve_pool_chart_phys', self.pgChart, self._chart_curves_by_phys.get(phys))
+                self._chart_curves_by_phys.pop(phys, None)
+            for phys in list(self._instant_curves_by_phys.keys()):
+                self._release_curve_to_pool('_curve_pool_instant_phys', self.pgInstant, self._instant_curves_by_phys.get(phys))
+                self._instant_curves_by_phys.pop(phys, None)
+
+        if not show_calc:
+            for cc in list(self._chart_curves_by_calc.keys()):
+                self._release_curve_to_pool('_curve_pool_chart_calc', self.pgChart, self._chart_curves_by_calc.get(cc))
+                self._chart_curves_by_calc.pop(cc, None)
+            for cc in list(self._instant_curves_by_calc.keys()):
+                self._release_curve_to_pool('_curve_pool_instant_calc', self.pgInstant, self._instant_curves_by_calc.get(cc))
+                self._instant_curves_by_calc.pop(cc, None)
+
+        # Keep x/y history aligned when plot visibility changes.
+        try:
+            self._chart_x.clear()
+        except Exception:
+            pass
+        try:
+            self._preview_queue.clear()
+        except Exception:
+            pass
+        for dq in self._chart_y_by_phys.values():
+            try:
+                dq.clear()
+            except Exception:
+                pass
+        for dq in self._chart_y_by_calc.values():
+            try:
+                dq.clear()
+            except Exception:
+                pass
+        self._rebuild_legends()
+
+    def _build_preview_indices(self, t_arr: np.ndarray, ref_blocks: List[np.ndarray]) -> np.ndarray:
+        try:
+            n = int(np.asarray(t_arr).size)
+        except Exception:
+            n = 0
+        if n <= 0:
+            return np.zeros((0,), dtype=np.int64)
+
+        target = int(getattr(self, "_preview_points_per_block", 1200) or 1200)
+        if target < 64:
+            target = 64
+
+        if n <= target or not bool(getattr(self, "_preview_minmax_enabled", True)):
+            return np.arange(n, dtype=np.int64)
+
+        ref = None
+        for arr in ref_blocks or []:
+            try:
+                a = np.asarray(arr, dtype=np.float32).reshape(-1)
+            except Exception:
+                continue
+            if int(a.size) == n:
+                ref = a
+                break
+
+        if ref is None:
+            return np.linspace(0, n - 1, num=min(n, target), dtype=np.int64)
+
+        bins = max(1, target // 2)
+
+        edges = np.empty(bins + 1, dtype=np.int64)
+        edges[:] = np.linspace(0, n, bins + 1, dtype=np.int64, endpoint=True)
+
+        need = bins * 2 + 4
+        scratch = getattr(self, "_preview_idx_scratch", None)
+        if not isinstance(scratch, np.ndarray) or scratch.dtype != np.int64 or scratch.size < need:
+            scratch = np.empty(need, dtype=np.int64)
+            self._preview_idx_scratch = scratch
+
+        k = 0
+        for i in range(bins):
+            a = int(edges[i])
+            b = int(edges[i + 1])
+            if b <= a:
+                continue
+            seg = ref[a:b]
+            if seg.size <= 0:
+                continue
+            try:
+                lo = a + int(np.nanargmin(seg))
+            except Exception:
+                lo = a
+            try:
+                hi = a + int(np.nanargmax(seg))
+            except Exception:
+                hi = b - 1
+            if lo <= hi:
+                scratch[k] = lo
+                scratch[k + 1] = hi
+            else:
+                scratch[k] = hi
+                scratch[k + 1] = lo
+            k += 2
+
+        if k <= 0:
+            return np.linspace(0, n - 1, num=min(n, target), dtype=np.int64)
+
+        idx = np.asarray(scratch[:k], dtype=np.int64)
+        idx = idx[(idx >= 0) & (idx < n)]
+        if idx.size <= 0:
+            return np.linspace(0, n - 1, num=min(n, target), dtype=np.int64)
+
+        idx = np.unique(idx)
+        if idx[0] != 0:
+            idx = np.insert(idx, 0, 0)
+        if idx[-1] != (n - 1):
+            idx = np.append(idx, n - 1)
+
+        if idx.size > target:
+            step = max(1, int(np.ceil(float(idx.size) / float(target))))
+            idx = idx[::step]
+            if idx[-1] != (n - 1):
+                idx = np.append(idx, n - 1)
+
+        return idx
+
+    def _buffer_to_numpy(self, buf: Any, dtype=np.float32) -> np.ndarray:
+        if buf is None:
+            return np.array([], dtype=dtype)
+        try:
+            if hasattr(buf, "to_numpy"):
+                return np.asarray(buf.to_numpy(dtype=dtype), dtype=dtype)
+        except Exception:
+            pass
+        try:
+            n = int(len(buf))
+            if n <= 0:
+                return np.array([], dtype=dtype)
+            return np.fromiter(buf, dtype=dtype, count=n)
+        except Exception:
+            return np.array([], dtype=dtype)
+
+    def _get_subsample_indices(self, n: int, step: int) -> np.ndarray:
+        n = int(n)
+        step = max(1, int(step))
+        if n <= 0:
+            return np.zeros((0,), dtype=np.int64)
+        if step <= 1:
+            return np.arange(n, dtype=np.int64)
+        cache = getattr(self, "_plot_sample_idx_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._plot_sample_idx_cache = cache
+        key = (n, step)
+        idx = cache.get(key)
+        if isinstance(idx, np.ndarray) and idx.size > 0:
+            return idx
+        idx = np.arange(0, n, step, dtype=np.int64)
+        if idx.size <= 0 or idx[-1] != (n - 1):
+            idx = np.append(idx, n - 1)
+        cache[key] = idx
+        max_entries = int(getattr(self, "_plot_sample_idx_cache_limit", 32) or 32)
+        if len(cache) > max_entries:
+            # discard oldest insertion (dict preserves order in py3.7+)
+            try:
+                first_key = next(iter(cache.keys()))
+                cache.pop(first_key, None)
+            except Exception:
+                pass
+        return idx
+
+    def _sample_for_plot(self, arr: np.ndarray, step: int) -> np.ndarray:
+        if not isinstance(arr, np.ndarray):
+            arr = np.asarray(arr, dtype=np.float32)
+        if arr.size <= 1:
+            return arr
+        step = max(1, int(step))
+        if step <= 1:
+            return arr
+        idx = self._get_subsample_indices(int(arr.size), step)
+        if idx.size <= 0:
+            return arr
+        try:
+            return arr[idx]
+        except Exception:
+            return arr[::step]
+
+    def _is_plots_tab_active(self) -> bool:
+        try:
+            if not hasattr(self, "tabs"):
+                return True
+            if hasattr(self, "_plots_tab_index"):
+                return int(self.tabs.currentIndex()) == int(getattr(self, "_plots_tab_index", -1))
+            idx = int(self.tabs.currentIndex())
+            txt = str(self.tabs.tabText(idx) if idx >= 0 else "").strip().lower()
+            return txt.startswith("graf")
+        except Exception:
+            return True
+
+    def _recompute_history_capacity(self, force: bool = False) -> None:
+        now = time.monotonic()
+        cooldown = float(getattr(self, "_history_adjust_cooldown_s", 1.2) or 1.2)
+        if (not force) and ((now - float(getattr(self, "_last_history_adjust_ts", 0.0) or 0.0)) < cooldown):
+            return
+
+        try:
+            active_phys = max(1, int(len(getattr(self, "_current_phys_order", []) or [])))
+        except Exception:
+            active_phys = 1
+        try:
+            active_calc = max(0, int(len(getattr(self, "_chart_curves_by_calc", {}) or {})))
+        except Exception:
+            active_calc = 0
+        active_total = max(1, active_phys + active_calc)
+
+        plot_w = 1400
+        try:
+            plot_w = max(320, int(self.pgChart.width()))
+        except Exception:
+            pass
+
+        min_pts = int(getattr(self, "_history_min_points", 1200) or 1200)
+        max_pts = int(getattr(self, "_history_max_points", 12000) or 12000)
+        budget_pts = int(getattr(self, "_history_budget_points", 220000) or 220000)
+
+        width_target = max(min_pts, min(max_pts, int(plot_w * 4)))
+        budget_target = max(min_pts, min(max_pts, int(budget_pts / max(1, active_total))))
+        if active_total <= 2:
+            target = max(width_target, budget_target)
+        else:
+            target = min(width_target, budget_target)
+        target = max(min_pts, min(max_pts, int(target)))
+
+        current = int(getattr(self, "_chart_history_points", target) or target)
+        if (not force) and abs(target - current) < 256:
+            return
+
+        self._chart_history_points = int(target)
+        try:
+            self._chart_x.resize(int(target))
+        except Exception:
+            pass
+        for buf in list(getattr(self, "_chart_y_by_phys", {}).values()):
+            try:
+                buf.resize(int(target))
+            except Exception:
+                pass
+        for buf in list(getattr(self, "_chart_y_by_calc", {}).values()):
+            try:
+                buf.resize(int(target))
+            except Exception:
+                pass
+        try:
+            cache = getattr(self, "_plot_sample_idx_cache", None)
+            if isinstance(cache, dict):
+                cache.clear()
+        except Exception:
+            pass
+        self._last_history_adjust_ts = now
+
+
+    def _chart_series_key(self, kind: str, key: str) -> str:
+        return f"{kind}:{key}"
+
+    def _chart_mode(self) -> str:
+        return "overlay"
+
+    def _chart_focus(self) -> str:
+        try:
+            return str(self.cmbChartFocus.currentData(QtCore.Qt.UserRole) or "")
+        except Exception:
+            return ""
+
+    def _chart_relative_enabled(self) -> bool:
+        try:
+            return bool(self.chkChartRelativeTime.isChecked())
+        except Exception:
+            return True
+
+    def _chart_robust_enabled(self) -> bool:
+        try:
+            return bool(self.chkChartRobustY.isChecked())
+        except Exception:
+            return True
+
+    def _chart_lock_y_enabled(self) -> bool:
+        try:
+            return bool(self.chkChartLockY.isChecked())
+        except Exception:
+            return False
+
+    def _chart_window_seconds(self) -> float:
+        try:
+            return max(0.0, float(self.spinChartWindowSec.value()))
+        except Exception:
+            return 0.0
+
+    def _refresh_chart_focus_combo(self) -> None:
+        if not hasattr(self, "cmbChartFocus"):
+            return
+        try:
+            current = self._chart_focus()
+            items = [("Tutti", "")]
+            for phys in list(getattr(self, "_current_phys_order", []) or []):
+                label = self._label_by_phys.get(phys, phys)
+                items.append((f"{label}", self._chart_series_key("phys", phys)))
+            for cc in list(getattr(self, "_chart_curves_by_calc", {}).keys()):
+                label = cc
+                r = self._find_calc_row_by_cc(cc)
+                if r >= 0:
+                    it = self.calcTable.item(r, CCOL_LABEL)
+                    label = str((it.text() if it else cc) or cc).strip() or cc
+                items.append((f"{label} [calc]", self._chart_series_key("calc", cc)))
+
+            signature = tuple(items)
+            if signature == getattr(self, "_chart_focus_signature_cache", None):
+                return
+
+            self._chart_focus_signature_cache = signature
+            self.cmbChartFocus.blockSignals(True)
+            self.cmbChartFocus.clear()
+            for txt_item, key in items:
+                self.cmbChartFocus.addItem(txt_item, key)
+            idx = 0
+            if current:
+                for i in range(self.cmbChartFocus.count()):
+                    if str(self.cmbChartFocus.itemData(i, QtCore.Qt.UserRole) or "") == current:
+                        idx = i
+                        break
+            self.cmbChartFocus.setCurrentIndex(idx)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.cmbChartFocus.blockSignals(False)
+            except Exception:
+                pass
+
+    def _on_chart_view_option_changed(self, *_args):
+        self._legend_signature_cache = None
+        self._update_chart_relative_button_style()
+
+    def _on_chart_mode_changed(self, *_args):
+        self._on_chart_view_option_changed()
+
+    def _on_chart_focus_changed(self, *_args):
+        self._on_chart_view_option_changed()
+    def _update_chart_relative_button_style(self) -> None:
+        try:
+            btn = getattr(self, "chkChartRelativeTime", None)
+            if not isinstance(btn, QtWidgets.QPushButton):
+                return
+            if bool(btn.isChecked()):
+                btn.setStyleSheet(
+                    "QPushButton {background:#22c55e; color:#ffffff; border:1px solid #16a34a; font-weight:700;}"
+                    " QPushButton:hover {background:#16a34a;}"
+                )
+            else:
+                btn.setStyleSheet(
+                    "QPushButton {background:#9ca3af; color:#111827; border:1px solid #6b7280; font-weight:600;}"
+                    " QPushButton:hover {background:#6b7280; color:#ffffff;}"
+                )
+        except Exception:
+            pass
+
+    
+    def _update_chart_view_buttons_style(self) -> None:
+        try:
+            for btn in (self.chkPhysViewEnable, self.chkCalcViewEnable):
+                if not isinstance(btn, QtWidgets.QPushButton):
+                    continue
+                if bool(btn.isChecked()):
+                    btn.setStyleSheet(
+                        "QPushButton {background:#22c55e; color:#ffffff; border:1px solid #16a34a; font-weight:700;}"
+                        " QPushButton:hover {background:#16a34a;}"
+                    )
+                else:
+                    btn.setStyleSheet(
+                        "QPushButton {background:#9ca3af; color:#111827; border:1px solid #6b7280; font-weight:600;}"
+                        " QPushButton:hover {background:#6b7280; color:#ffffff;}"
+                    )
+        except Exception:
+            pass
+    def _on_chart_y_limits_changed(self, *_args):
+        try:
+            mode = str(self.cmbChartYScale.currentData(QtCore.Qt.UserRole) or "autoscale").strip().lower()
+            if mode == "lock":
+                self._on_chart_y_scale_changed(show_popup=True)
+        except Exception:
+            pass
+
+    def _on_chart_y_scale_changed(self, *_args, show_popup: bool = True):
+        try:
+            mode = str(self.cmbChartYScale.currentData(QtCore.Qt.UserRole) or "autoscale").strip().lower()
+            lock = (mode == "lock")
+            for w in (self.lblChartYMin, self.spinChartYMin, self.lblChartYMax, self.spinChartYMax):
+                w.setVisible(lock)
+
+            if lock:
+                y_min = float(self.spinChartYMin.value())
+                y_max = float(self.spinChartYMax.value())
+                if y_min >= y_max:
+                    self.spinChartYMin.setValue(-1.0)
+                    self.spinChartYMax.setValue(1.0)
+                    if show_popup:
+                        QtWidgets.QMessageBox.warning(self, "Scala Y", "Y min >= Y max valori ignorati")
+                    try:
+                        self.cmbChartYScale.blockSignals(True)
+                        self.cmbChartYScale.setCurrentIndex(0)
+                    finally:
+                        self.cmbChartYScale.blockSignals(False)
+                    lock = False
+                else:
+                    self._chart_locked_ylim = (y_min, y_max)
+
+            self.chkChartLockY.setChecked(lock)
+            self.chkChartRobustY.setChecked(not lock)
+            if not lock:
+                self._chart_locked_ylim = None
+                for w in (self.lblChartYMin, self.spinChartYMin, self.lblChartYMax, self.spinChartYMax):
+                    w.setVisible(False)
+            self._on_chart_view_option_changed()
+        except Exception:
+            pass
+
+    def _on_chart_preset_changed(self, *_args):
+        try:
+            name = str(self.cmbChartPreset.currentText() or "").strip() or "Operativo"
+            self._apply_chart_preset(name)
+        except Exception:
+            pass
+
+    def _on_chart_cursor_moved(self, *_args):
+        self._update_chart_cursor_info()
+
+    def _apply_chart_preset(self, name: str, force: bool = False) -> None:
+        preset = str(name or "").strip().lower()
+        if preset not in ("operativo", "diagnostica", "prestazioni"):
+            preset = "operativo"
+        if (not force) and str(getattr(self, "_chart_preset_active", "")).strip().lower() == preset:
+            return
+        self._chart_preset_active = preset
+        try:
+            if preset == "diagnostica":
+                self.cmbChartMode.setCurrentText("Stacked")
+                self.chkChartRelativeTime.setChecked(True)
+                self.spinChartWindowSec.setValue(0.0)
+                self.chkChartRobustY.setChecked(False)
+                self.chkChartLockY.setChecked(False)
+                self.chkChartCursors.setChecked(True)
+            elif preset == "prestazioni":
+                self.cmbChartMode.setCurrentText("Overlay")
+                self.chkChartRelativeTime.setChecked(True)
+                self.spinChartWindowSec.setValue(20.0)
+                self.chkChartRobustY.setChecked(True)
+                self.chkChartLockY.setChecked(False)
+                self.chkChartCursors.setChecked(False)
+                self._plot_render_max_points = min(int(getattr(self, "_plot_render_max_points", 2500) or 2500), 1800)
+            else:
+                self.cmbChartMode.setCurrentText("Overlay")
+                self.chkChartRelativeTime.setChecked(True)
+                self.spinChartWindowSec.setValue(60.0)
+                self.chkChartRobustY.setChecked(True)
+                self.chkChartLockY.setChecked(False)
+                self.chkChartCursors.setChecked(False)
+        except Exception:
+            pass
+
+    def _on_chart_fit_clicked(self):
+        try:
+            self._chart_locked_ylim = None
+            if hasattr(self, "chkChartLockY"):
+                self.chkChartLockY.setChecked(False)
+            self.pgChart.getPlotItem().enableAutoRange(x=True, y=True)
+            self.pgChart.getPlotItem().autoRange()
+        except Exception:
+            pass
+
+    def _on_chart_reset_view_clicked(self):
+        try:
+            self.spinChartWindowSec.setValue(0.0)
+            self.chkChartRelativeTime.setChecked(True)
+            if hasattr(self, "cmbChartYScale"):
+                self.cmbChartYScale.setCurrentIndex(0)
+                self._on_chart_y_scale_changed(show_popup=False)
+            if hasattr(self, "cmbChartFocus"):
+                self.cmbChartFocus.setCurrentIndex(0)
+            self._chart_locked_ylim = None
+        except Exception:
+            pass
+
+    def _update_chart_cursor_info(self):
+        try:
+            enabled = bool(getattr(self, "chkChartCursors", None) and self.chkChartCursors.isChecked())
+            if not enabled:
+                self._chart_cursor_a.hide(); self._chart_cursor_b.hide()
+                if hasattr(self, "lblChartCursorInfo"):
+                    self.lblChartCursorInfo.setText("")
+                return
+            series_map = dict(getattr(self, "_chart_last_series_by_key", {}) or {})
+            if not series_map:
+                if hasattr(self, "lblChartCursorInfo"):
+                    self.lblChartCursorInfo.setText("Cursori: nessun dato disponibile")
+                return
+            self._chart_cursor_a.show(); self._chart_cursor_b.show()
+            focus = self._chart_focus()
+            if focus not in series_map:
+                focus = next(iter(series_map.keys()))
+            x_arr, y_arr, label = series_map.get(focus, (None, None, focus))
+            if not isinstance(x_arr, np.ndarray) or not isinstance(y_arr, np.ndarray):
+                return
+            m = np.isfinite(x_arr) & np.isfinite(y_arr)
+            if int(np.count_nonzero(m)) < 2:
+                return
+            xf = x_arr[m]; yf = y_arr[m]
+            xmin = float(xf[0]); xmax = float(xf[-1])
+            if xmax <= xmin:
+                xmax = xmin + 1.0
+            xa = float(self._chart_cursor_a.value()); xb = float(self._chart_cursor_b.value())
+            if (not np.isfinite(xa)) or xa < xmin or xa > xmax:
+                xa = xmin + 0.25 * (xmax - xmin); self._chart_cursor_a.setValue(xa)
+            if (not np.isfinite(xb)) or xb < xmin or xb > xmax or abs(xb - xa) < 1e-12:
+                xb = xmin + 0.75 * (xmax - xmin); self._chart_cursor_b.setValue(xb)
+            ia = int(np.clip(np.searchsorted(xf, xa, side='left'), 0, len(xf) - 1))
+            ib = int(np.clip(np.searchsorted(xf, xb, side='left'), 0, len(xf) - 1))
+            ya = float(yf[ia]); yb = float(yf[ib])
+            if hasattr(self, "lblChartCursorInfo"):
+                self.lblChartCursorInfo.setText(f"Cursori [{label}]  A: x={xa:.3f}, y={ya:.6g}  |  B: x={xb:.3f}, y={yb:.6g}  |  dT={xb-xa:.3f}, dY={yb-ya:.6g}")
+        except Exception:
+            pass
+
+
+    def _drain_preview_queue(self, show_phys: bool, show_calc: bool) -> None:
+        q = getattr(self, "_preview_queue", None)
+        if q is None:
+            return
+        budget = int(getattr(self, "_preview_apply_blocks_per_tick", 3) or 3)
+        if budget < 1:
+            budget = 1
+        loops = min(int(len(q)), budget)
+        for _ in range(loops):
+            try:
+                blk = q.popleft()
+            except Exception:
+                break
+            if not isinstance(blk, dict):
+                continue
+            t_prev = np.asarray(blk.get("t", []), dtype=np.float64).reshape(-1)
+            if t_prev.size <= 0:
+                continue
+            try:
+                last_t = float(getattr(self, "_chart_last_preview_t", np.nan))
+            except Exception:
+                last_t = np.nan
+            t0 = float(t_prev[0]) if t_prev.size > 0 else np.nan
+            if bool(getattr(self, "_chart_gap_between_blocks", True)) and np.isfinite(last_t) and np.isfinite(t0) and (t0 > last_t):
+                self._chart_x.append(np.float64(np.nan))
+                for buf in list(getattr(self, "_chart_y_by_phys", {}).values()):
+                    try:
+                        buf.append(np.float32(np.nan))
+                    except Exception:
+                        pass
+                for buf in list(getattr(self, "_chart_y_by_calc", {}).values()):
+                    try:
+                        buf.append(np.float32(np.nan))
+                    except Exception:
+                        pass
+            self._chart_x.extend(t_prev)
+            if show_phys:
+                for phys, y in dict(blk.get("phys", {}) or {}).items():
+                    buf = self._chart_y_by_phys.get(phys)
+                    if buf is None:
+                        continue
+                    try:
+                        buf.extend(np.asarray(y, dtype=np.float32).reshape(-1))
+                    except Exception:
+                        pass
+            if show_calc:
+                for cc, y in dict(blk.get("calc", {}) or {}).items():
+                    buf = self._chart_y_by_calc.get(cc)
+                    if buf is None:
+                        buf = FloatRingBuffer(int(getattr(self, "_chart_history_points", 12000) or 12000))
+                        self._chart_y_by_calc[cc] = buf
+                    try:
+                        buf.extend(np.asarray(y, dtype=np.float32).reshape(-1))
+                    except Exception:
+                        pass
+            try:
+                finite = t_prev[np.isfinite(t_prev)]
+                if finite.size > 0:
+                    self._chart_last_preview_t = float(finite[-1])
+            except Exception:
+                pass
+
+    def _rr_select(self, items: List[Any], cursor_attr: str, budget: int) -> List[Any]:
+        if not items:
+            return []
+        n = len(items)
+        if budget <= 0 or n <= budget:
+            setattr(self, cursor_attr, 0)
+            return items
+        start = int(getattr(self, cursor_attr, 0) or 0) % n
+        out = [items[(start + i) % n] for i in range(budget)]
+        setattr(self, cursor_attr, (start + budget) % n)
+        return out
+
+    def _update_render_guardrail(self, frame_ms: float) -> None:
+        try:
+            alpha = 0.2
+            prev = float(getattr(self, "_refresh_ewma_ms", 0.0) or 0.0)
+            if prev <= 0.0:
+                prev = float(frame_ms)
+            ewma = (1.0 - alpha) * prev + alpha * float(frame_ms)
+            self._refresh_ewma_ms = ewma
+
+            q = getattr(self, "_preview_queue", None)
+            q_len = int(len(q)) if q is not None else 0
+            q_cap = int(getattr(q, "maxlen", 0) or 0)
+            q_ratio = (float(q_len) / float(q_cap)) if q_cap > 0 else 0.0
+
+            high_ms = float(getattr(self, "_guardrail_high_ms", 35.0) or 35.0)
+            low_ms = float(getattr(self, "_guardrail_low_ms", 18.0) or 18.0)
+            rss_mb = float(self._get_process_rss_mb())
+            rss_hi = float(getattr(self, "_guardrail_rss_high_mb", 900.0) or 900.0)
+            rss_lo = float(getattr(self, "_guardrail_rss_low_mb", 720.0) or 720.0)
+
+            high = (ewma >= high_ms) or (q_ratio >= 0.8) or (rss_mb > 0.0 and rss_mb >= rss_hi)
+            low = (ewma <= low_ms) and (q_ratio <= 0.2) and ((rss_mb <= 0.0) or (rss_mb <= rss_lo))
+
+            if high:
+                self._guardrail_active = True
+                self._plot_render_max_points = max(
+                    int(getattr(self, "_guardrail_min_render_points", 700) or 700),
+                    int(float(self._plot_render_max_points) * 0.9),
+                )
+                self._render_budget_curves = max(2, int(float(self._render_budget_curves) * 0.9))
+                self._render_budget_curves_instant = max(2, int(float(self._render_budget_curves_instant) * 0.9))
+                self._preview_apply_blocks_per_tick = max(1, int(float(self._preview_apply_blocks_per_tick) * 0.9))
+                return
+
+            if not low:
+                return
+
+            default_points = int(getattr(self, "_plot_render_max_points_default", 2500) or 2500)
+            default_chart_budget = int(getattr(self, "_render_budget_curves_default", 8) or 8)
+            default_instant_budget = int(getattr(self, "_render_budget_curves_instant_default", 8) or 8)
+            default_preview_budget = int(getattr(self, "_preview_apply_blocks_per_tick_default", 3) or 3)
+
+            self._plot_render_max_points = min(default_points, int(self._plot_render_max_points + 120))
+            self._render_budget_curves = min(default_chart_budget, int(self._render_budget_curves + 1))
+            self._render_budget_curves_instant = min(default_instant_budget, int(self._render_budget_curves_instant + 1))
+            self._preview_apply_blocks_per_tick = min(default_preview_budget, int(self._preview_apply_blocks_per_tick + 1))
+
+            if (
+                self._plot_render_max_points >= default_points
+                and self._render_budget_curves >= default_chart_budget
+                and self._render_budget_curves_instant >= default_instant_budget
+                and self._preview_apply_blocks_per_tick >= default_preview_budget
+            ):
+                self._guardrail_active = False
+        except Exception:
+            pass
+    def _get_process_rss_mb(self) -> float:
+        try:
+            import psutil  # type: ignore
+            return float(psutil.Process(os.getpid()).memory_info().rss) / (1024.0 * 1024.0)
+        except Exception:
+            return 0.0
+
+    def _window_is_background(self) -> bool:
+        try:
+            if not self.isVisible():
+                return True
+            w = self.window() if hasattr(self, "window") else self
+            if w is not None and bool(w.isMinimized()):
+                return True
+            app = QtWidgets.QApplication.instance()
+            aw = app.activeWindow() if app is not None else None
+            if aw is None:
+                return False
+            return (aw is not self) and (w is None or aw is not w)
+        except Exception:
+            return False
+
+    def _update_ui_render_profile(self) -> None:
+        try:
+            bg = bool(self._window_is_background())
+            if bg == bool(getattr(self, "_ui_profile_background", False)):
+                return
+            self._ui_profile_background = bg
+
+            if bg:
+                try:
+                    if hasattr(self, "guiTimer") and self.guiTimer is not None:
+                        self.guiTimer.setInterval(int(getattr(self, "_bg_gui_interval", 300) or 300))
+                except Exception:
+                    pass
+                self._render_budget_curves = max(1, int(getattr(self, "_bg_render_budget_curves", 2) or 2))
+                self._render_budget_curves_instant = max(1, int(getattr(self, "_bg_render_budget_curves_instant", 2) or 2))
+                self._preview_apply_blocks_per_tick = max(1, int(getattr(self, "_bg_preview_apply_blocks", 1) or 1))
+            else:
+                try:
+                    if hasattr(self, "guiTimer") and self.guiTimer is not None:
+                        self.guiTimer.setInterval(int(getattr(self, "_default_gui_interval", 120) or 120))
+                except Exception:
+                    pass
+                self._render_budget_curves = max(1, int(getattr(self, "_render_budget_curves_default", 8) or 8))
+                self._render_budget_curves_instant = max(1, int(getattr(self, "_render_budget_curves_instant_default", 8) or 8))
+                self._preview_apply_blocks_per_tick = max(1, int(getattr(self, "_preview_apply_blocks_per_tick_default", 3) or 3))
+        except Exception:
+            pass
+
+    def _sample_performance_metrics(self) -> None:
+        try:
+            rss_mb = float(self._get_process_rss_mb())
+            q = getattr(self, "_preview_queue", None)
+            q_len = int(len(q)) if q is not None else 0
+            q_cap = int(getattr(q, "maxlen", 0) or 0)
+            row = {
+                "ts": float(time.time()),
+                "rss_mb": rss_mb,
+                "frame_ms_ewma": float(getattr(self, "_refresh_ewma_ms", 0.0) or 0.0),
+                "queue_len": q_len,
+                "queue_cap": q_cap,
+                "queue_dropped": int(getattr(self, "_preview_queue_dropped", 0) or 0),
+                "budget_chart": int(getattr(self, "_render_budget_curves", 0) or 0),
+                "budget_instant": int(getattr(self, "_render_budget_curves_instant", 0) or 0),
+                "budget_preview": int(getattr(self, "_preview_apply_blocks_per_tick", 0) or 0),
+                "gui_interval_ms": int(self.guiTimer.interval()) if hasattr(self, "guiTimer") else 0,
+                "guardrail": int(bool(getattr(self, "_guardrail_active", False))),
+                "background": int(bool(getattr(self, "_ui_profile_background", False))),
+            }
+            perf = getattr(self, "_perf_metrics", None)
+            if isinstance(perf, deque):
+                perf.append(row)
+
+            if not bool(getattr(self, "_perf_logging_enabled", False)):
+                return
+            log_path = str(getattr(self, "_perf_log_path", "") or "").strip()
+            if not log_path:
+                return
+            need_header = not os.path.isfile(log_path)
+            with open(log_path, "a", encoding="utf-8") as f:
+                if need_header:
+                    f.write("ts,rss_mb,frame_ms_ewma,queue_len,queue_cap,queue_dropped,budget_chart,budget_instant,budget_preview,gui_interval_ms,guardrail,background\n")
+                f.write(
+                    f"{row['ts']:.6f},{row['rss_mb']:.3f},{row['frame_ms_ewma']:.3f},{row['queue_len']},{row['queue_cap']},{row['queue_dropped']},"
+                    f"{row['budget_chart']},{row['budget_instant']},{row['budget_preview']},{row['gui_interval_ms']},{row['guardrail']},{row['background']}\n"
+                )
+        except Exception:
+            pass
+
+    def _build_legend_signature(self) -> Tuple[Any, ...]:
+        try:
+            phys = tuple((str(p), str(getattr(self, "_start_label_by_phys", {}).get(p, getattr(self, "_label_by_phys", {}).get(p, p)))) for p in list(getattr(self, "_current_phys_order", []) or []))
+        except Exception:
+            phys = tuple()
+        try:
+            calc = tuple(sorted(str(k) for k in dict(getattr(self, "_chart_curves_by_calc", {}) or {}).keys()))
+        except Exception:
+            calc = tuple()
+        try:
+            show_phys = bool(self.chkPhysViewEnable.isChecked())
+        except Exception:
+            show_phys = False
+        try:
+            show_calc = bool(self.chkCalcViewEnable.isChecked())
+        except Exception:
+            show_calc = False
+        return (phys, calc, show_phys, show_calc)
+
+    def _acquire_curve_from_pool(self, pool_attr: str, plot_widget: Any, label: str, color: Any, width: float = 1.5):
+        curve = None
+        pool = getattr(self, pool_attr, None)
+        if isinstance(pool, list) and pool:
+            try:
+                curve = pool.pop()
+            except Exception:
+                curve = None
+        if curve is None:
+            curve = pg.PlotDataItem()
+        try:
+            curve.clear()
+        except Exception:
+            pass
+        try:
+            curve.setPen(pg.mkPen(color=color, width=width))
+        except Exception:
+            pass
+        try:
+            curve.setName(label)
+        except Exception:
+            pass
+        try:
+            curve.setClipToView(True)
+            curve.setDownsampling(auto=True, mode='peak')
+        except Exception:
+            pass
+        try:
+            plot_widget.addItem(curve)
+        except Exception:
+            pass
+        return curve
+
+    def _release_curve_to_pool(self, pool_attr: str, plot_widget: Any, curve: Any) -> None:
+        if curve is None:
+            return
+        try:
+            plot_widget.removeItem(curve)
+        except Exception:
+            pass
+        try:
+            curve.clear()
+        except Exception:
+            pass
+        pool = getattr(self, pool_attr, None)
+        if not isinstance(pool, list):
+            return
+        max_pool = int(getattr(self, '_curve_pool_max', 48) or 48)
+        if len(pool) >= max_pool:
+            return
+        total_limit = int(getattr(self, '_curve_pool_max_total', max_pool * 2) or (max_pool * 2))
+        total = 0
+        for attr in ('_curve_pool_chart_phys', '_curve_pool_instant_phys', '_curve_pool_chart_calc', '_curve_pool_instant_calc'):
+            arr = getattr(self, attr, None)
+            if isinstance(arr, list):
+                total += len(arr)
+        if total >= total_limit:
+            return
+        pool.append(curve)
+
+    def _ensure_phys_plot_curves(self, show_phys: bool, instant_enabled: bool) -> None:
+        expected = set(self._current_phys_order) if show_phys else set()
+        changed = False
+
+        for phys in list(self._chart_curves_by_phys.keys()):
+            if phys in expected:
+                continue
+            self._release_curve_to_pool('_curve_pool_chart_phys', self.pgChart, self._chart_curves_by_phys.get(phys))
+            self._chart_curves_by_phys.pop(phys, None)
+            changed = True
+
+        for phys in list(self._instant_curves_by_phys.keys()):
+            if phys in expected and instant_enabled:
+                continue
+            self._release_curve_to_pool('_curve_pool_instant_phys', self.pgInstant, self._instant_curves_by_phys.get(phys))
+            self._instant_curves_by_phys.pop(phys, None)
+            changed = True
+
+        if not show_phys:
+            if changed:
+                self._rebuild_legends()
+            return
+
+        num_ch = max(1, len(self._current_phys_order))
+        for idx, phys in enumerate(self._current_phys_order):
+            base_label = self._label_by_phys.get(phys, phys)
+            unit = ''
+            if hasattr(self, '_calib_by_phys'):
+                try:
+                    unit = str(self._calib_by_phys.get(phys, {}).get('unit', '') or '')
+                except Exception:
+                    unit = ''
+            label = f"{base_label} [{unit}]" if unit else base_label
+            try:
+                color = pg.intColor(idx, hues=max(8, num_ch))
+            except Exception:
+                color = (255, 0, 0)
+
+            chart_curve = self._chart_curves_by_phys.get(phys)
+            if chart_curve is None:
+                self._chart_curves_by_phys[phys] = self._acquire_curve_from_pool(
+                    '_curve_pool_chart_phys', self.pgChart, label, color, width=1.5
+                )
+                changed = True
+            else:
+                try:
+                    chart_curve.setName(label)
+                    chart_curve.setPen(pg.mkPen(color=color, width=1.5))
+                except Exception:
+                    pass
+
+            if not instant_enabled:
+                continue
+
+            instant_curve = self._instant_curves_by_phys.get(phys)
+            if instant_curve is None:
+                self._instant_curves_by_phys[phys] = self._acquire_curve_from_pool(
+                    '_curve_pool_instant_phys', self.pgInstant, label, color, width=1.5
+                )
+                changed = True
+            else:
+                try:
+                    instant_curve.setName(label)
+                    instant_curve.setPen(pg.mkPen(color=color, width=1.5))
+                except Exception:
+                    pass
+
+        if changed:
+            self._rebuild_legends()
 
     def _calc_visible_ids(self) -> List[str]:
         if not bool(self.chkCalcViewEnable.isChecked()):
@@ -1482,41 +2840,60 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         return out
 
     def _sync_calc_plot_curves(self) -> None:
-        visible = set(self._calc_visible_ids())
+        show_calc = bool(self.chkCalcViewEnable.isChecked())
+        instant_enabled = bool(getattr(self, '_instant_plot_enabled', True))
+        visible = set(self._calc_visible_ids()) if show_calc else set()
 
         for cc in list(self._chart_curves_by_calc.keys()):
-            if cc in visible:
+            if cc in visible and show_calc:
                 continue
-            try:
-                self.pgChart.removeItem(self._chart_curves_by_calc[cc])
-            except Exception:
-                pass
+            self._release_curve_to_pool('_curve_pool_chart_calc', self.pgChart, self._chart_curves_by_calc.get(cc))
             self._chart_curves_by_calc.pop(cc, None)
+
         for cc in list(self._instant_curves_by_calc.keys()):
-            if cc in visible:
+            if cc in visible and show_calc and instant_enabled:
                 continue
-            try:
-                self.pgInstant.removeItem(self._instant_curves_by_calc[cc])
-            except Exception:
-                pass
+            self._release_curve_to_pool('_curve_pool_instant_calc', self.pgInstant, self._instant_curves_by_calc.get(cc))
             self._instant_curves_by_calc.pop(cc, None)
 
         phys_count = max(1, len(self._current_phys_order))
         for idx, cc in enumerate(sorted(visible, key=lambda x: int(x[2:]) if x[2:].isdigit() else 0)):
             if cc not in self._chart_y_by_calc:
-                self._chart_y_by_calc[cc] = deque(maxlen=12000)
+                self._chart_y_by_calc[cc] = FloatRingBuffer(int(getattr(self, '_chart_history_points', 12000) or 12000))
             if cc not in self._instant_y_by_calc:
                 self._instant_y_by_calc[cc] = np.array([], dtype=float)
-            label_item = self.calcTable.item(self._find_calc_row_by_cc(cc), CCOL_LABEL)
+
+            row = self._find_calc_row_by_cc(cc)
+            label_item = self.calcTable.item(row, CCOL_LABEL) if row >= 0 else None
             label = str(label_item.text().strip() if label_item else cc) or cc
             color = pg.intColor(phys_count + idx, hues=max(16, phys_count + len(visible)))
-            if cc not in self._chart_curves_by_calc:
-                c = self.pgChart.plot(name=label, pen=pg.mkPen(color=color, width=1.3))
-                self._chart_curves_by_calc[cc] = c
-            if cc not in self._instant_curves_by_calc:
-                ic = self.pgInstant.plot(name=label, pen=pg.mkPen(color=color, width=1.3))
-                self._instant_curves_by_calc[cc] = ic
+
+            if show_calc:
+                if cc not in self._chart_curves_by_calc:
+                    self._chart_curves_by_calc[cc] = self._acquire_curve_from_pool(
+                        '_curve_pool_chart_calc', self.pgChart, label, color, width=1.3
+                    )
+                else:
+                    try:
+                        self._chart_curves_by_calc[cc].setName(label)
+                        self._chart_curves_by_calc[cc].setPen(pg.mkPen(color=color, width=1.3))
+                    except Exception:
+                        pass
+
+            if show_calc and instant_enabled:
+                if cc not in self._instant_curves_by_calc:
+                    self._instant_curves_by_calc[cc] = self._acquire_curve_from_pool(
+                        '_curve_pool_instant_calc', self.pgInstant, label, color, width=1.3
+                    )
+                else:
+                    try:
+                        self._instant_curves_by_calc[cc].setName(label)
+                        self._instant_curves_by_calc[cc].setPen(pg.mkPen(color=color, width=1.3))
+                    except Exception:
+                        pass
+
         self._rebuild_legends()
+        self._calc_curve_layout_dirty = False
 
     def _evaluate_calculated_block(self, phys_eng: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         fs = float(getattr(self.acq, "current_rate_hz", 0.0) or 0.0)
@@ -3446,6 +4823,12 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     def _reset_plots(self):
         self._chart_x.clear()
+        self._pending_table_updates.clear()
+        self._legend_signature_cache = None
+        try:
+            self._preview_queue.clear()
+        except Exception:
+            pass
         for dq in self._chart_y_by_phys.values(): dq.clear()
         for dq in self._chart_y_by_calc.values(): dq.clear()
         self._instant_t = np.array([], dtype=float)
@@ -3455,17 +4838,13 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self._last_fft_compute_ts = 0.0
 
         for c in list(self._chart_curves_by_phys.values()):
-            try: self.pgChart.removeItem(c)
-            except Exception: pass
+            self._release_curve_to_pool('_curve_pool_chart_phys', self.pgChart, c)
         for c in list(self._chart_curves_by_calc.values()):
-            try: self.pgChart.removeItem(c)
-            except Exception: pass
+            self._release_curve_to_pool('_curve_pool_chart_calc', self.pgChart, c)
         for c in list(self._instant_curves_by_phys.values()):
-            try: self.pgInstant.removeItem(c)
-            except Exception: pass
+            self._release_curve_to_pool('_curve_pool_instant_phys', self.pgInstant, c)
         for c in list(self._instant_curves_by_calc.values()):
-            try: self.pgInstant.removeItem(c)
-            except Exception: pass
+            self._release_curve_to_pool('_curve_pool_instant_calc', self.pgInstant, c)
         self._chart_curves_by_phys.clear()
         self._instant_curves_by_phys.clear()
         self._chart_curves_by_calc.clear()
@@ -3488,6 +4867,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             pass
         self._chart_legend.clear()
         self._instant_legend.clear()
+        self._legend_signature_cache = None
 
         # Cancella la stringa delle medie quando si resettano i grafici
         try:
@@ -3498,67 +4878,17 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     def _reset_plots_curves(self):
         self._reset_plots()
-        # Assign distinct colors to each channel for better readability
-        num_ch = max(1, len(self._current_phys_order))
-        for idx, phys in enumerate(self._current_phys_order):
-            unit = self._calib_by_phys.get(phys, {}).get("unit", "")
-            base_label = self._label_by_phys.get(phys, phys)
-            label = f"{base_label} [{unit}]" if unit else base_label
-            # Use a distinct color based on the index; pg.intColor returns a QColor
-            try:
-                color = pg.intColor(idx, hues=max(8, num_ch))
-            except Exception:
-                color = (255, 0, 0)  # fallback to red
-            # Chart (concatenated)
-            c = self.pgChart.plot(name=label, pen=pg.mkPen(color=color, width=1.5))
-            try:
-                c.setClipToView(True)
-                c.setDownsampling(auto=True, mode='peak')
-            except Exception:
-                pass
-            self._chart_curves_by_phys[phys] = c
-            self._chart_legend.addItem(c, label)
-            # Instant block plot
-            ic = self.pgInstant.plot(name=label, pen=pg.mkPen(color=color, width=1.5))
-            try:
-                ic.setClipToView(True)
-                ic.setDownsampling(auto=True, mode='peak')
-            except Exception:
-                pass
-            self._instant_curves_by_phys[phys] = ic
-            self._instant_legend.addItem(ic, label)
-
-            # FFT plot: crea una curva per questo canale e aggiungila alla
-            # legenda FFT.  Non si applica decimazione o clipping qui perch?
-            # l'FFT ? giaun riassunto della finestra selezionata.
-            try:
-                cfft = self.pgFFT.plot(name=label, pen=pg.mkPen(color=color, width=1.5))
-            except Exception:
-                cfft = None
-            if cfft is not None:
-                try:
-                    # Lascio ClipToView disabilitato per l'FFT; eventuale
-                    # riduzione di punti sar? gestita dal calcolo stesso.
-                    pass
-                except Exception:
-                    pass
-                self._fft_curves_by_phys[phys] = cfft
-                try:
-                    self._fft_legend.addItem(cfft, label)
-                except Exception:
-                    pass
-
-        # Reset last FFT results and title when channels are rebuilt.
-        self._last_fft_freq = None
-        self._last_fft_mag_by_phys.clear()
-        try:
-            title = f"Spettro FFT (finestra {self._fft_duration_seconds:.3g} s)"
-            self.pgFFT.setTitle(title)
-        except Exception:
-            pass
+        self._ensure_phys_plot_curves(
+            show_phys=bool(self.chkPhysViewEnable.isChecked()),
+            instant_enabled=bool(getattr(self, '_instant_plot_enabled', True)),
+        )
         self._sync_calc_plot_curves()
 
-    def _rebuild_legends(self):
+    def _rebuild_legends(self, force: bool = False):
+        signature = self._build_legend_signature()
+        if (not force) and signature == getattr(self, "_legend_signature_cache", None):
+            return
+        self._legend_signature_cache = signature
         self._chart_legend.clear()
         self._instant_legend.clear()
         for phys, curve in self._chart_curves_by_phys.items():
@@ -3619,6 +4949,15 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     def _clear_chart(self):
         self._chart_x.clear()
+        self._pending_table_updates.clear()
+        self._legend_signature_cache = None
+        self._chart_last_preview_t = np.nan
+        self._chart_last_series_by_key = {}
+        self._chart_locked_ylim = None
+        try:
+            self._preview_queue.clear()
+        except Exception:
+            pass
         for phys, curve in self._chart_curves_by_phys.items():
             self._chart_y_by_phys[phys].clear()
             curve.clear()
@@ -3627,11 +4966,25 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             if dq is not None:
                 dq.clear()
             curve.clear()
+        try:
+            self._chart_cursor_a.hide(); self._chart_cursor_b.hide()
+        except Exception:
+            pass
+        try:
+            self.lblChartCursorInfo.setText("")
+        except Exception:
+            pass
 
-    # slot dai segnali (main thread)
     def _slot_instant_block(self, t: np.ndarray, ys: list, names: list):
         try:
             self._instant_t = np.asarray(t, dtype=float)
+            _bg_compact = bool(
+                getattr(self, '_compact_instant_when_background', True)
+                and self._window_is_background()
+                and (not bool(getattr(self, '_instant_plot_enabled', True)))
+            )
+            if _bg_compact and self._instant_t.size > 1:
+                self._instant_t = self._instant_t[-1:]
             # mappa nome di start -> phys
             start_to_phys = {name: phys for phys, name in self._start_label_by_phys.items()}
             eng_by_phys = {}
@@ -3640,7 +4993,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 if not phys: continue
                 cal = self._calib_by_phys.get(phys, {"a":1.0,"b":0.0})
                 a = float(cal.get("a",1.0)); b = float(cal.get("b",0.0))
-                y_eng = a * np.asarray(y, dtype=float) + b
+                y_src = np.asarray(y, dtype=float)
+                if _bg_compact and y_src.size > 1:
+                    y_src = y_src[-1:]
+                y_eng = a * y_src + b
                 self._instant_y_by_phys[phys] = y_eng
                 eng_by_phys[phys] = y_eng
             calc_data = self._evaluate_calculated_block(eng_by_phys)
@@ -3649,6 +5005,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self._update_calc_table_values(calc_data)
             self._sync_calc_plot_curves()
             if self._fft_enabled:
+                self._ensure_fft_worker()
                 payload = {"t": np.asarray(self._instant_t, dtype=np.float64), "y_map": eng_by_phys}
                 self.sigFftWorkerBlock.emit(payload)
 
@@ -3661,129 +5018,309 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
 
     def _slot_chart_points(self, t_pts: np.ndarray, ys_pts: list, names: list):
         try:
-            t_pts = np.asarray(t_pts, dtype=float)
-            self._chart_x.extend(t_pts.tolist())
+            show_phys = bool(self.chkPhysViewEnable.isChecked())
+            show_calc = bool(self.chkCalcViewEnable.isChecked())
+            if not (show_phys or show_calc):
+                return
+            if not self._is_plots_tab_active():
+                return
+            if bool(getattr(self, '_suspend_preview_when_background', True)) and self._window_is_background():
+                try:
+                    self._preview_queue.clear()
+                except Exception:
+                    pass
+                return
+
+            t_pts = np.asarray(t_pts, dtype=np.float64).reshape(-1)
+            if t_pts.size <= 0:
+                return
+
             start_to_phys = {name: phys for phys, name in self._start_label_by_phys.items()}
-            eng_by_phys = {}
+            phys_full = {}
+            ref_blocks = []
+
             for name, ypts in zip(names, ys_pts):
                 phys = start_to_phys.get(name)
-                if not phys: continue
-                cal = self._calib_by_phys.get(phys, {"a":1.0,"b":0.0})
-                a = float(cal.get("a",1.0)); b = float(cal.get("b",0.0))
-                y_eng = a * np.asarray(ypts, dtype=float) + b
-                self._chart_y_by_phys[phys].extend(y_eng.tolist())
-                eng_by_phys[phys] = y_eng
-            try:
-                dec_step = int(getattr(self.acq, "chart_decimation", 1) or 1)
-            except Exception:
-                dec_step = 1
-            if dec_step <= 0:
-                dec_step = 1
-            expected = int(t_pts.size)
-            for cc, arr in dict(self._instant_y_by_calc or {}).items():
-                a = np.asarray(arr, dtype=float).reshape(-1)
-                y_dec = a[::dec_step] if dec_step > 1 else a
-                if expected > 0:
-                    if y_dec.size > expected:
-                        y_dec = y_dec[:expected]
-                    elif y_dec.size < expected and y_dec.size > 0:
-                        y_dec = np.pad(y_dec, (0, expected - y_dec.size), mode="edge")
-                dq = self._chart_y_by_calc.get(cc)
-                if dq is None:
-                    dq = deque(maxlen=12000)
-                    self._chart_y_by_calc[cc] = dq
-                dq.extend(y_dec.tolist())
+                if not phys:
+                    continue
+                y_raw = np.asarray(ypts, dtype=np.float32).reshape(-1)
+                if y_raw.size != t_pts.size:
+                    continue
+                if hasattr(self, "_calib_by_phys"):
+                    cal = self._calib_by_phys.get(phys, {"a": 1.0, "b": 0.0})
+                    a = np.float32(float(cal.get("a", 1.0)))
+                    b = np.float32(float(cal.get("b", 0.0)))
+                    y_eng = a * y_raw + b
+                else:
+                    y_eng = y_raw
+                if show_phys:
+                    phys_full[phys] = y_eng
+                ref_blocks.append(y_eng)
+
+            if not ref_blocks:
+                ref_blocks = [np.asarray(ys_pts[0], dtype=np.float32).reshape(-1)] if ys_pts else []
+
+            idx = self._build_preview_indices(t_pts, ref_blocks)
+            if idx.size <= 0:
+                return
+
+            t_prev = np.asarray(t_pts[idx], dtype=np.float64)
+            payload_phys = {}
+            if show_phys:
+                for phys, arr in phys_full.items():
+                    if arr.size == t_pts.size:
+                        payload_phys[phys] = np.asarray(arr[idx], dtype=np.float32)
+
+            payload_calc = {}
+            if show_calc:
+                try:
+                    dec_step = int(getattr(self.acq, "chart_decimation", 1) or 1)
+                except Exception:
+                    dec_step = 1
+                if dec_step <= 0:
+                    dec_step = 1
+                expected = int(t_pts.size)
+                for cc, arr in dict(self._instant_y_by_calc or {}).items():
+                    a = np.asarray(arr, dtype=np.float32).reshape(-1)
+                    y_dec = a[::dec_step] if dec_step > 1 else a
+                    if expected > 0:
+                        if y_dec.size > expected:
+                            y_dec = y_dec[:expected]
+                        elif y_dec.size < expected and y_dec.size > 0:
+                            y_dec = np.pad(y_dec, (0, expected - y_dec.size), mode="edge")
+                    if y_dec.size == expected and expected > 0:
+                        payload_calc[cc] = np.asarray(y_dec[idx], dtype=np.float32)
+
+            if not payload_phys and not payload_calc:
+                return
+
+            max_blocks = int(getattr(self, "_preview_queue_max_blocks", 24) or 24)
+            if max_blocks < 4:
+                max_blocks = 4
+            if not hasattr(self, "_preview_queue"):
+                self._preview_queue = deque(maxlen=max_blocks)
+            if int(getattr(self._preview_queue, "maxlen", 0) or 0) != max_blocks:
+                self._preview_queue = deque(self._preview_queue, maxlen=max_blocks)
+
+            if len(self._preview_queue) >= max_blocks:
+                self._preview_queue_dropped = int(getattr(self, "_preview_queue_dropped", 0) or 0) + 1
+
+            self._preview_queue.append({"t": t_prev, "phys": payload_phys, "calc": payload_calc})
         except RuntimeError:
             pass
 
-    def _on_instant_view_toggled(self, checked: bool) -> None:
-        self._instant_plot_enabled = bool(checked)
-        if self._instant_plot_enabled:
-            return
-        for curve in self._instant_curves_by_phys.values():
-            try:
-                curve.clear()
-            except Exception:
-                pass
-        for curve in self._instant_curves_by_calc.values():
-            try:
-                curve.clear()
-            except Exception:
-                pass
-
     def _refresh_plots(self):
-        self._sync_calc_plot_curves()
-        # chart concatenato
+        frame_t0 = time.perf_counter()
+
+        if bool(getattr(self, "_calc_curve_layout_dirty", True)):
+            self._sync_calc_plot_curves()
+
+        show_phys = bool(self.chkPhysViewEnable.isChecked())
+        show_calc = bool(self.chkCalcViewEnable.isChecked())
+        chart_visible = bool(self.pgChart.isVisible())
+
+        if not self._is_plots_tab_active():
+            self._update_render_guardrail((time.perf_counter() - frame_t0) * 1000.0)
+            return
+
+        if bool(getattr(self, '_suspend_preview_when_background', True)) and self._window_is_background():
+            try:
+                self._preview_queue.clear()
+            except Exception:
+                pass
+            self._update_render_guardrail((time.perf_counter() - frame_t0) * 1000.0)
+            return
+
+        self._update_ui_render_profile()
+        self._recompute_history_capacity()
+        self._ensure_phys_plot_curves(
+            show_phys=show_phys,
+            instant_enabled=bool(getattr(self, '_instant_plot_enabled', True)),
+        )
+        self._drain_preview_queue(show_phys=show_phys, show_calc=show_calc)
+        self._refresh_chart_focus_combo()
+
+        self._chart_last_series_by_key = {}
         n = len(self._chart_x)
-        if n > 1:
-            x = np.fromiter(self._chart_x, dtype=float, count=n)
-            for phys, curve in self._chart_curves_by_phys.items():
-                dq = self._chart_y_by_phys.get(phys)
-                if not dq:
-                    continue
-                y = np.fromiter(dq, dtype=float, count=len(dq))
-                if y.size == x.size and y.size > 1:
-                    curve.setData(x, y)
-            for cc, curve in self._chart_curves_by_calc.items():
-                dq = self._chart_y_by_calc.get(cc)
-                if not dq:
-                    continue
-                y = np.fromiter(dq, dtype=float, count=len(dq))
-                if y.size == x.size and y.size > 1:
-                    curve.setData(x, y)
+        mode = self._chart_mode()
+        focus_key = self._chart_focus()
+        relative_time = self._chart_relative_enabled()
+        robust_y = self._chart_robust_enabled()
+        lock_y = self._chart_lock_y_enabled()
+        window_s = self._chart_window_seconds()
 
-        # blocco istantaneo
-        if self._instant_plot_enabled and isinstance(self._instant_t, np.ndarray) and self._instant_t.size > 1:
-            for phys, curve in self._instant_curves_by_phys.items():
-                y = self._instant_y_by_phys.get(phys)
-                if isinstance(y, np.ndarray) and y.size == self._instant_t.size and y.size > 1:
-                    curve.setData(self._instant_t, y)
-            for cc, curve in self._instant_curves_by_calc.items():
-                y = self._instant_y_by_calc.get(cc)
-                if isinstance(y, np.ndarray) and y.size == self._instant_t.size and y.size > 1:
-                    curve.setData(self._instant_t, y)
+        if chart_visible and n > 1 and (show_phys or show_calc):
+            x = self._buffer_to_numpy(self._chart_x, dtype=np.float64)
+            if x.size > 1:
+                valid_x = np.isfinite(x)
+                if int(np.count_nonzero(valid_x)) > 1:
+                    x_view = np.array(x, dtype=np.float64, copy=True)
+                    if relative_time:
+                        try:
+                            x0 = float(x_view[valid_x][0])
+                            x_view[valid_x] = x_view[valid_x] - np.float64(x0)
+                        except Exception:
+                            pass
+                    x_f = x_view[valid_x]
+                    x_min = float(np.min(x_f)); x_max = float(np.max(x_f))
+                    if window_s > 0.0 and np.isfinite(x_max):
+                        x_min = max(x_min, x_max - float(window_s))
 
-        # Mostra media del blocco istantaneo per canali fisici + calcolati abilitati.
+                    target = int(getattr(self, "_plot_render_max_points", 2500) or 2500)
+                    if target < 300:
+                        target = 300
+                    step = max(1, int(np.ceil(float(x_view.size) / float(target))))
+                    x_plot = self._sample_for_plot(x_view, step)
+                    x_mask = np.isfinite(x_plot)
+                    if window_s > 0.0:
+                        x_mask = x_mask & (x_plot >= np.float64(x_min))
+                    if int(np.count_nonzero(x_mask)) <= 1:
+                        x_mask = np.isfinite(x_plot)
+
+                    jobs = []
+                    if show_phys:
+                        for phys, curve in self._chart_curves_by_phys.items():
+                            jobs.append(("phys", phys, curve))
+                    if show_calc:
+                        for cc, curve in self._chart_curves_by_calc.items():
+                            jobs.append(("calc", cc, curve))
+
+                    if focus_key:
+                        for kind, key, curve in jobs:
+                            if self._chart_series_key(kind, key) != focus_key:
+                                try: curve.setData([], [])
+                                except Exception: pass
+                        jobs = [job for job in jobs if self._chart_series_key(job[0], job[1]) == focus_key]
+
+                    key_order = [self._chart_series_key(kind, key) for kind, key, _ in jobs]
+                    index_map = {k: i for i, k in enumerate(key_order)}
+
+                    spans = []
+                    for kind, key, _curve in jobs[:32]:
+                        y = self._buffer_to_numpy(self._chart_y_by_phys.get(key)) if kind == "phys" else self._buffer_to_numpy(self._chart_y_by_calc.get(key))
+                        if y.size != x_view.size or y.size <= 1:
+                            continue
+                        ys = self._sample_for_plot(y, step)
+                        ys = ys[np.isfinite(ys)]
+                        if ys.size > 8:
+                            try:
+                                lo = float(np.percentile(ys, 1.0)); hi = float(np.percentile(ys, 99.0)); span = hi - lo
+                                if np.isfinite(span) and span > 0.0: spans.append(span)
+                            except Exception:
+                                pass
+                    global_span = float(np.median(np.asarray(spans, dtype=np.float64))) if spans else 1.0
+                    if (not np.isfinite(global_span)) or global_span <= 1e-12:
+                        global_span = 1.0
+
+                    budget = int(getattr(self, "_render_budget_curves", 8) or 8)
+                    if budget < 1: budget = 1
+                    selected = self._rr_select(jobs, "_rr_cursor_chart", budget)
+
+                    y_chunks = []
+                    for kind, key, curve in selected:
+                        y = self._buffer_to_numpy(self._chart_y_by_phys.get(key)) if kind == "phys" else self._buffer_to_numpy(self._chart_y_by_calc.get(key))
+                        if y.size != x_view.size or y.size <= 1:
+                            continue
+                        y_plot = self._sample_for_plot(y, step)
+                        if y_plot.size != x_plot.size:
+                            continue
+                        skey = self._chart_series_key(kind, key)
+                        idx = int(index_map.get(skey, 0))
+                        if mode == "offset":
+                            y_draw = y_plot + np.float32(idx * global_span * 0.8)
+                        elif mode == "stacked":
+                            y_draw = y_plot + np.float32(idx * global_span * 1.8)
+                        else:
+                            y_draw = y_plot
+                        xd = x_plot[x_mask] if int(np.count_nonzero(x_mask)) > 1 else x_plot
+                        yd = y_draw[x_mask] if int(np.count_nonzero(x_mask)) > 1 else y_draw
+                        if xd.size <= 1 or yd.size <= 1:
+                            continue
+                        try:
+                            curve.setData(xd, yd)
+                            self._chart_last_series_by_key[skey] = (np.asarray(xd, dtype=np.float64), np.asarray(yd, dtype=np.float32), str(key))
+                        except Exception:
+                            continue
+                        yv = yd[np.isfinite(yd)]
+                        if yv.size > 0:
+                            y_chunks.append(yv)
+
+                    if np.isfinite(x_min) and np.isfinite(x_max):
+                        if x_max <= x_min: x_max = x_min + 1.0
+                        try: self.pgChart.setXRange(float(x_min), float(x_max), padding=0.01)
+                        except Exception: pass
+
+                    if lock_y and isinstance(getattr(self, "_chart_locked_ylim", None), tuple):
+                        try:
+                            yl = self._chart_locked_ylim
+                            self.pgChart.setYRange(float(yl[0]), float(yl[1]), padding=0.0)
+                        except Exception:
+                            pass
+                    elif y_chunks:
+                        try:
+                            y_all = np.concatenate(y_chunks)
+                            if y_all.size > 8 and robust_y:
+                                y_lo = float(np.percentile(y_all, 1.0)); y_hi = float(np.percentile(y_all, 99.0))
+                            else:
+                                y_lo = float(np.min(y_all)); y_hi = float(np.max(y_all))
+                            if np.isfinite(y_lo) and np.isfinite(y_hi):
+                                if y_hi <= y_lo:
+                                    d = 1.0 if abs(y_lo) < 1e-9 else abs(y_lo) * 0.1
+                                    y_lo -= d; y_hi += d
+                                pad = max(1e-9, (y_hi - y_lo) * 0.08)
+                                yl = (float(y_lo - pad), float(y_hi + pad))
+                                self._chart_locked_ylim = yl
+                                self.pgChart.setYRange(yl[0], yl[1], padding=0.0)
+                        except Exception:
+                            pass
+
+        instant_enabled = bool(getattr(self, "_instant_plot_enabled", True))
+        if instant_enabled and isinstance(self._instant_t, np.ndarray) and self._instant_t.size > 1:
+            jobs_inst = []
+            if show_phys:
+                for phys, curve in self._instant_curves_by_phys.items():
+                    jobs_inst.append(("phys", phys, curve))
+            if show_calc:
+                for cc, curve in self._instant_curves_by_calc.items():
+                    jobs_inst.append(("calc", cc, curve))
+            if focus_key:
+                jobs_inst = [job for job in jobs_inst if self._chart_series_key(job[0], job[1]) == focus_key]
+            ibudget = int(getattr(self, "_render_budget_curves_instant", 8) or 8)
+            if ibudget < 1: ibudget = 1
+            for kind, key, curve in self._rr_select(jobs_inst, "_rr_cursor_instant", ibudget):
+                y = self._instant_y_by_phys.get(key) if kind == "phys" else self._instant_y_by_calc.get(key)
+                if isinstance(y, np.ndarray) and y.size == self._instant_t.size and y.size > 1:
+                    try: curve.setData(self._instant_t, y)
+                    except Exception: pass
+
+        self._update_chart_cursor_info()
+        self._update_render_guardrail((time.perf_counter() - frame_t0) * 1000.0)
         try:
             if hasattr(self, 'lblAvgChart'):
                 avg_strings = []
-                # Fisici attivi in ordine di start
                 for phys in self._current_phys_order:
                     y = self._instant_y_by_phys.get(phys)
                     if isinstance(y, np.ndarray) and y.size > 0:
                         try:
-                            avg_val = float(np.mean(y))
-                            label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys))
-                            unit = self._calib_by_phys.get(phys, {}).get('unit', '')
+                            avg_val = float(np.mean(y)); label = self._start_label_by_phys.get(phys, self._label_by_phys.get(phys, phys)); unit = self._calib_by_phys.get(phys, {}).get('unit', '')
                             avg_strings.append(f"{label}: {avg_val:.6g}" + (f" {unit}" if unit else ""))
                         except Exception:
                             pass
-                # Calcolati abilitati (locali modulo)
                 for r in range(self.calcTable.rowCount()):
                     try:
                         it_en = self.calcTable.item(r, CCOL_ENABLE)
-                        if it_en is None or it_en.checkState() != QtCore.Qt.Checked:
-                            continue
-                        cc = self._calc_channel_id_for_row(r)
-                        formula = str(self._calc_formula_by_cc.get(cc, "") or "").strip()
-                        if not formula:
-                            continue
-                        if cc in self._calc_compile_errors:
-                            continue
+                        if it_en is None or it_en.checkState() != QtCore.Qt.Checked: continue
+                        cc = self._calc_channel_id_for_row(r); formula = str(self._calc_formula_by_cc.get(cc, "") or "").strip()
+                        if (not formula) or (cc in self._calc_compile_errors): continue
                         y = self._instant_y_by_calc.get(cc)
-                        if not isinstance(y, np.ndarray) or y.size <= 0:
-                            continue
-                        avg_val = float(np.mean(y))
-                        it_label = self.calcTable.item(r, CCOL_LABEL)
-                        label = str((it_label.text() if it_label else cc) or cc).strip() or cc
+                        if not isinstance(y, np.ndarray) or y.size <= 0: continue
+                        avg_val = float(np.mean(y)); it_label = self.calcTable.item(r, CCOL_LABEL); label = str((it_label.text() if it_label else cc) or cc).strip() or cc
                         avg_strings.append(f"{label}: {avg_val:.6g}")
                     except Exception:
-                        pass
-                self.lblAvgChart.setText(", ".join(avg_strings) if avg_strings else "")
+                        continue
+                self.lblAvgChart.setText(" | ".join(avg_strings))
         except Exception:
             pass
-
-        # FFT computation is disk-driven in _slot_instant_block.
 
     def _set_fft_window_lines_visible(self, visible: bool) -> None:
         # Window markers over decimated chart intentionally disabled.
@@ -3888,6 +5425,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             pass
 
     def _emit_fft_worker_config(self) -> None:
+        if bool(getattr(self, "_fft_enabled", False)):
+            self._ensure_fft_worker()
         try:
             fs = float(getattr(self.acq, "current_rate_hz", 0.0) or 0.0)
         except Exception:
@@ -3915,6 +5454,8 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._reset_fft_buffers()
+        if bool(getattr(self, "_fft_enabled", False)):
+            self._ensure_fft_worker()
         self.sigFftWorkerReset.emit(True, True)
         self._fft_chunk_window_idx = 0
         self._last_fft_compute_ts = 0.0
@@ -3969,6 +5510,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         if self._fft_enabled:
             # Clear previous spectra so the next display corresponds only to
             # the current FFT-buffer selection.
+            self._ensure_fft_worker()
             self._reset_fft_buffers()
             self.sigFftWorkerReset.emit(True, True)
             self._fft_chunk_window_idx = 0
@@ -4100,7 +5642,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             ans = QtWidgets.QMessageBox.question(
                 self,
                 "Conferma sovrascrittura",
-                "Scheda già presente vuoi sovrascriverla?",
+                "Scheda giÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¾ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â  presente vuoi sovrascriverla?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No,
             )
@@ -4131,6 +5673,14 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         except Exception:
             gen["ram_mb"] = ""
         gen["fs"] = (self.rateEdit.text() or "").strip()
+        gen["show_phys_plot"] = "1" if bool(self.chkPhysViewEnable.isChecked()) else "0"
+        gen["show_calc_plot"] = "1" if bool(self.chkCalcViewEnable.isChecked()) else "0"
+        gen["chart_preset"] = str(self.cmbChartPreset.currentText() or "Operativo")
+        gen["chart_mode"] = str(self.cmbChartMode.currentText() or "Overlay")
+        gen["chart_window_s"] = str(float(self.spinChartWindowSec.value()))
+        gen["chart_robust_y"] = "1" if bool(self.chkChartRobustY.isChecked()) else "0"
+        gen["chart_lock_y"] = "1" if bool(self.chkChartLockY.isChecked()) else "0"
+        gen["chart_cursors"] = "1" if bool(self.chkChartCursors.isChecked()) else "0"
 
         chsec = cfg[sec_channels]
         all_phys = []
@@ -4269,6 +5819,24 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
                 self._on_rate_edit_finished()
             except Exception:
                 pass
+        try:
+            self.chkPhysViewEnable.setChecked(str(gen.get("show_phys_plot", "0")).strip().lower() in ("1", "true", "yes", "on"))
+        except Exception:
+            pass
+        try:
+            self.chkCalcViewEnable.setChecked(str(gen.get("show_calc_plot", "0")).strip().lower() in ("1", "true", "yes", "on"))
+        except Exception:
+            pass
+        try:
+            self.cmbChartPreset.setCurrentText(str(gen.get("chart_preset", "Operativo") or "Operativo"))
+            self.cmbChartMode.setCurrentText(str(gen.get("chart_mode", "Overlay") or "Overlay"))
+            self.chkChartRelativeTime.setChecked(True)
+            self.spinChartWindowSec.setValue(float(str(gen.get("chart_window_s", "60")).strip() or "0"))
+            self.chkChartRobustY.setChecked(str(gen.get("chart_robust_y", "1")).strip().lower() in ("1", "true", "yes", "on"))
+            self.chkChartLockY.setChecked(str(gen.get("chart_lock_y", "0")).strip().lower() in ("1", "true", "yes", "on"))
+            self.chkChartCursors.setChecked(str(gen.get("chart_cursors", "0")).strip().lower() in ("1", "true", "yes", "on"))
+        except Exception:
+            pass
         self._sync_emit_status_update()
 
         self._populate_type_column()
@@ -4447,6 +6015,38 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             pass
 
     # ----------------------------- Valore istantaneo in tabella -----------------------------
+    def _queue_table_value_update(self, start_label_name, raw_value):
+        try:
+            key = str(start_label_name or "")
+        except Exception:
+            key = ""
+        if not key:
+            return
+        pending = getattr(self, "_pending_table_updates", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            self._pending_table_updates = pending
+        pending[key] = raw_value
+        min_interval = float(getattr(self, "_table_value_min_interval_s", 0.12) or 0.12)
+        now = time.monotonic()
+        last = float(getattr(self, "_last_table_flush_ts", 0.0) or 0.0)
+        if (now - last) >= min_interval:
+            self._flush_table_value_updates()
+
+    def _flush_table_value_updates(self):
+        pending = getattr(self, "_pending_table_updates", None)
+        if not isinstance(pending, dict) or not pending:
+            return
+        self._pending_table_updates = {}
+        self._last_table_flush_ts = time.monotonic()
+        for start_label_name, raw_value in pending.items():
+            try:
+                self._update_table_value(start_label_name, raw_value)
+            except RuntimeError:
+                pass
+            except Exception:
+                pass
+
     def _update_table_value(self, start_label_name, val_volt_zeroed):
         # mappa dal nome al phys usato allo start
         phys = None
@@ -4511,7 +6111,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             pass
 
     def _stop_periodic_timers_for_shutdown(self) -> None:
-        for tname in ("guiTimer", "_count_timer", "_backlog_timer"):
+        for tname in ("guiTimer", "_count_timer", "_backlog_timer", "_perf_timer", "_table_flush_timer", "_ui_profile_timer"):
             try:
                 t = getattr(self, tname, None)
                 if t is not None and t.isActive():
@@ -4718,6 +6318,7 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
         self.btnAddCalcChannel.setEnabled(not lock)
         self.btnResetCalc.setEnabled(not lock)
         self.chkCalcViewEnable.setEnabled(not lock)
+        self.chkPhysViewEnable.setEnabled(not lock)
         nrows = self.calcTable.rowCount()
         for r in range(nrows):
             for col in (CCOL_ENABLE, CCOL_ID, CCOL_FORMULA, CCOL_LABEL, CCOL_VALUE, CCOL_ZERO_VAL, CCOL_PLOT):
@@ -4759,6 +6360,10 @@ class AcquisitionWindow(QtWidgets.QMainWindow):
             self._auto_change = False
         # applica lo stato all'acquisizione
         self._update_acquisition_from_table()
+
+
+
+
 
 
 
