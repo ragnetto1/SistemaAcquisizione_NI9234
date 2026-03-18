@@ -77,7 +77,13 @@ class TdmsMerger:
 
     # -------------------- utilità interne --------------------
     def _pick_group(self, td: TdmsFile):
-        """Preferisce il gruppo 'Acquisition', altrimenti il primo disponibile."""
+        """Preferisce un gruppo 'Acquisition_*', altrimenti 'Acquisition' o il primo disponibile."""
+        try:
+            for grp in td.groups():
+                if str(getattr(grp, "name", "") or "").startswith("Acquisition_"):
+                    return td[grp.name]
+        except Exception:
+            pass
         try:
             if "Acquisition" in td.groups():
                 return td["Acquisition"]
@@ -141,6 +147,7 @@ class TdmsMerger:
         t0_first = None
         fs = None
         seg_times_iso = []
+        merged_group_name = ""
 
         for path in segs:
             try:
@@ -150,6 +157,7 @@ class TdmsMerger:
             grp = self._pick_group(td)
             if grp is None:
                 continue
+            merged_group_name = merged_group_name or str(getattr(grp, "name", "") or "Acquisition")
             # Determine channel names (excluding Time) once
             if ch_names is None:
                 try:
@@ -305,7 +313,8 @@ class TdmsMerger:
                         "wf_start_time": t0_first,
                         "wf_increment": dt,
                     })
-                    group = GroupObject("Acquisition")
+                    group_name = str(merged_group_name or "Acquisition")
+                    group = GroupObject(group_name)
                 except Exception:
                     if progress_cb:
                         try:
@@ -317,7 +326,7 @@ class TdmsMerger:
                 channels = []
                 try:
                     channels.append(
-                        ChannelObject("Acquisition", "Time", t_rel, properties={
+                        ChannelObject(group_name, "Time", t_rel, properties={
                             "unit_string": "s",
                             "wf_start_time": t0_first,
                             "wf_increment": dt,
@@ -340,7 +349,7 @@ class TdmsMerger:
                         props = dict(props_cache.get(nm, {}))
                         props["wf_start_time"] = t0_first
                         props["wf_increment"] = dt
-                        channels.append(ChannelObject("Acquisition", nm, arr, properties=props))
+                        channels.append(ChannelObject(group_name, nm, arr, properties=props))
                     # Write this segment to the writer
                     w.write_segment([root, group] + channels)
                 except Exception:
