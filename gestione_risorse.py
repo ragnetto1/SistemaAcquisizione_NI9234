@@ -301,7 +301,7 @@ class ResourceManagerDialog(QtWidgets.QDialog):
                 if not parent_win.is_channel_enabled(ch):
                     res = QtWidgets.QMessageBox.question(
                         self, "Canale non abilitato",
-                        f"Il canale {ch} non e abilitato, vuoi abilitarlo per prendere la misura?",
+                        f"Il canale {ch} non ? abilitato, vuoi abilitarlo per prendere la misura?",
                         QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                         QtWidgets.QMessageBox.Yes)
                     if res == QtWidgets.QMessageBox.Yes:

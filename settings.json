@@ -1,7 +1,7 @@
 ﻿{
-  "save_dir": "C:\\UG-WORK\\SistemaAcquisizione_CDAQ\\SenzaNome_18-03-2026_12-12-51\\_sync_spool\\NI9234_cDAQ2Mod3",
-  "base_filename": "SenzaNome.tdms",
-  "ram_mb": 10,
+  "save_dir": "C:\\UG-WORK\\SistemaAcquisizione_CDAQ\\SoackTest1h_13-03-2026_15-00-07\\NI9234_cDAQ2Mod3",
+  "base_filename": "SoackTest1h.tdms",
+  "ram_mb": 12,
   "show_phys_plot": false,
   "show_calc_plot": false,
   "chart_preset": "Operativo",
@@ -9,6 +9,5 @@
   "chart_window_s": 0.0,
   "chart_robust_y": true,
   "chart_lock_y": false,
-  "chart_cursors": false,
-  "fs": 120.0
+  "chart_cursors": false
 }
